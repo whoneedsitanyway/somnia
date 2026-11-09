@@ -1,0 +1,14 @@
+# ninja log v7
+2	53	1794195577826811820	/Users/adstarshinov/projects/audio/Somnia/build/_deps/juce-build/tools/CMakeFiles/cmake.verify_globs	629e59bee1c340fa
+51	112	1794169038985245001	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_core/juce_core_CompilationTime.cpp.o	1f0284acf45d86c9
+50	331	1794169038984844083	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_graphics/juce_graphics_Sheenbidi.c.o	b732d80e7b8ea9bb
+52	2275	1794169038986591754	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_data_structures/juce_data_structures.mm.o	e2689eba8f2af08a
+50	2845	1794169038984416415	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/juce_build_tools/juce_build_tools.cpp.o	a6fe2eb696d381a5
+50	2950	1794169038984134457	extras/Build/juceaide/CMakeFiles/juceaide.dir/Main.cpp.o	6e73c45ba97d1e3b
+51	3327	1794169038985112334	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_events/juce_events.mm.o	4f8ac8ec0c012995
+52	4885	1794169038986375337	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_core/juce_core.mm.o	2b945155873fcb4d
+50	7118	1794169038984981833	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_graphics/juce_graphics.mm.o	c38b4e3f12e3eb34
+50	7604	1794169038984705291	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_graphics/juce_graphics_Harfbuzz.cpp.o	ae87c6d73b3d7832
+50	10204	1794169038984557833	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_gui_basics/juce_gui_basics.mm.o	d73716ba60aaaf31
+10205	10393	1794169049139320759	extras/Build/juceaide/juceaide_artefacts/Debug/juceaide	55bc861f793dbba4
+3	47	1794204602710964870	/Users/adstarshinov/projects/audio/Somnia/build/_deps/juce-build/tools/CMakeFiles/cmake.verify_globs	629e59bee1c340fa

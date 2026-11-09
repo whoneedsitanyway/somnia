@@ -1,0 +1,10 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/adstarshinov/projects/audio/Somnia/build/_deps/juce-build/tools/cmake_install.cmake",
+		"/Users/adstarshinov/projects/audio/Somnia/build/_deps/juce-build/tools/modules/cmake_install.cmake",
+		"/Users/adstarshinov/projects/audio/Somnia/build/_deps/juce-build/tools/extras/Build/cmake_install.cmake",
+		"/Users/adstarshinov/projects/audio/Somnia/build/_deps/juce-build/tools/extras/Build/juceaide/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
