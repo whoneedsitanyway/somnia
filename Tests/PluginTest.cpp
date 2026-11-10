@@ -57,7 +57,8 @@ namespace
         }
     };
 
-    bool renderSeconds (SomniaAudioProcessor& proc, double seconds, double& peakOut)
+    bool renderSeconds (SomniaAudioProcessor& proc, double seconds, double& peakOut,
+                        double toneHz = 220.0)
     {
         juce::AudioBuffer<float> buffer (2, block);
         juce::MidiBuffer midi;
@@ -70,11 +71,11 @@ namespace
             for (int i = 0; i < block; ++i)
             {
                 const float s = (float) (0.4 * std::sin (phase + 2.0 * juce::MathConstants<double>::pi
-                                                                  * 220.0 * (double) i / sr));
+                                                                  * toneHz * (double) i / sr));
                 buffer.setSample (0, i, s);
                 buffer.setSample (1, i, s);
             }
-            phase += 2.0 * juce::MathConstants<double>::pi * 220.0 * block / sr;
+            phase += 2.0 * juce::MathConstants<double>::pi * toneHz * block / sr;
 
             proc.processBlock (buffer, midi);
 
@@ -197,7 +198,12 @@ int main()
 
         proc.setTransport (2);
         double recPeak = 0.0;
-        renderSeconds (proc, 0.6, recPeak);
+        // The loop holds the 220 Hz tone used for the take, so punching in with
+        // the same tone would make the check depend on the phase between the dry
+        // input and the loop: at an unlucky loop length they cancel and the sum
+        // drops below the input alone.  A different frequency makes the two
+        // components incoherent, so their peaks add up as intended.
+        renderSeconds (proc, 0.6, recPeak, 1000.0);
         proc.setTransport (0);
         renderSeconds (proc, 0.05, recPeak);
 
@@ -205,7 +211,12 @@ int main()
 
         if (! overdubLevelOk)
             std::cout << "overdub peak=" << recPeak
-                      << " playPeak=" << playPeak << std::endl;
+                      << " playPeak=" << playPeak
+                      << " rec=" << proc.getDisplayRecording()
+                      << " fresh=" << proc.getDisplayFreshRecording()
+                      << " content=" << proc.getDisplayHasContent()
+                      << " env=" << proc.getDisplayEnvelopeLevel()
+                      << std::endl;
 
         i = 0;
         for (const char* id : kClean)

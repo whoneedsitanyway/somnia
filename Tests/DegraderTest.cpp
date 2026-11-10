@@ -164,13 +164,64 @@ int main()
     deg.process (outL.data(), outR.data(), n, extreme, rng);
     const bool nanOk = finite (outL);
 
+    // --- sample-and-hold is a freeze, not a gap ------------------------------
+    // A hold used to fade the gain to zero within ~2 ms, which made the frozen
+    // sample inaudible: the effect could never be heard.  During a hold the gain
+    // must stay at unity (the freeze itself is the effect).
+    bool holdOk = false;
+    {
+        somnia::TapeDegrader d;
+        d.prepare (sr);
+
+        somnia::TapeDegrader::Params hp;
+        hp.wear = 1.0f;
+        hp.dropouts = 1.0f;
+        hp.oxide = 0.0f;
+        hp.wow = 0.0f;
+        hp.hiss = 0.0f;
+        hp.tone = 1.0f;
+        hp.sat = 0.0f;
+
+        std::vector<float> bl (1024), br (1024);
+        bool sawHold = false;
+        float minGainWhileHolding = 1.0f;
+        int   holdBlocks = 0;
+
+        for (int b = 0; b < 600; ++b)   // ~12 s: a hold is guaranteed to appear
+        {
+            for (size_t i = 0; i < bl.size(); ++i)
+            {
+                const float s = (float) (0.5 * std::sin (2.0 * juce::MathConstants<double>::pi
+                                                         * 440.0 * (double) i / sr));
+                bl[i] = s;
+                br[i] = s;
+            }
+
+            d.process (bl.data(), br.data(), (int) bl.size(), hp, rng);
+
+            if (d.isHolding())
+            {
+                sawHold = true;
+                ++holdBlocks;
+                minGainWhileHolding = juce::jmin (minGainWhileHolding, d.getDropoutGain());
+            }
+        }
+
+        holdOk = sawHold && holdBlocks > 0 && minGainWhileHolding > 0.9f;
+
+        if (! holdOk)
+            std::cout << "hold: saw=" << sawHold << " blocks=" << holdBlocks
+                      << " minGain=" << minGainWhileHolding << std::endl;
+    }
+
     std::cout << "cleanRms=" << cleanRms << " wornRms=" << wornRms
               << " minGain=" << minGain << " extremeMax=" << extremeMax
               << " clean=" << cleanOk << " dark=" << darkOk
               << " drop=" << dropoutOk << " hiss=" << hissOk
+              << " hold=" << holdOk
               << " extreme=" << extremeOk << " nan=" << nanOk << std::endl;
 
-    if (! (cleanOk && darkOk && dropoutOk && hissOk && extremeOk && nanOk))
+    if (! (cleanOk && darkOk && dropoutOk && hissOk && extremeOk && nanOk && holdOk))
     {
         std::cout << "FAIL: tape degrader" << std::endl;
         return 1;

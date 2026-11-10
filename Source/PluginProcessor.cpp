@@ -130,14 +130,19 @@ void SomniaAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock
 
     setLatencySamples (0);
 
+    // The scratch buffers are sized here, once: setSize() in processBlock would
+    // allocate on the audio thread.  samplesPerBlock is the host's upper bound,
+    // and a little headroom keeps a host that rounds its block size up happy.
+    bufferCapacity = juce::jmax (samplesPerBlock, 512) + 256;
+
     tapeLoop.prepare (sampleRate, 60.0);
     tapeDegrader.prepare (sampleRate);
     loopAdsr.prepare (sampleRate);
     outputLimiter.prepare (sampleRate);
 
-    loopBuffer.setSize (2, samplesPerBlock, false, false, true);
-    wetBuffer.setSize (2, samplesPerBlock, false, false, true);
-    outBuffer.setSize (2, samplesPerBlock, false, false, true);
+    loopBuffer.setSize (2, bufferCapacity, false, false, true);
+    wetBuffer.setSize (2, bufferCapacity, false, false, true);
+    outBuffer.setSize (2, bufferCapacity, false, false, true);
 
     mixSmoothed.reset (sampleRate, 0.02);
     outputSmoothed.reset (sampleRate, 0.02);
@@ -243,6 +248,14 @@ void SomniaAudioProcessor::resetDsp()
     tapeDegrader.reset();
     loopAdsr.reset();
     outputLimiter.reset();
+
+    // A non-finite block means something upstream produced garbage; leaving the
+    // tape running would just feed the broken state back into the loop.  The
+    // transport is re-gated so the next block re-applies it from scratch instead
+    // of believing the tape is already in the requested state.
+    tapeLoop.stopPlayback();
+    tapeLoop.stopRecording();
+    lastTransport = -1;
 }
 
 //==============================================================================
@@ -351,11 +364,14 @@ void SomniaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                         releaseSec);
 
     // Retriggering the envelope on every pass only makes sense when the pass is
-    // long enough for the envelope to complete.  On a short loop (and ping-pong
-    // wraps twice as often) the attack would restart before reaching sustain,
-    // which made the loop nearly silent — the "PLAY stops working" report.
+    // long enough for the envelope to complete.  On a short loop the attack
+    // would restart before reaching sustain, which made the loop nearly silent
+    // — the "PLAY stops working" report.  A pass at 2x speed takes half the
+    // wall-clock time, so the varispeed has to be part of the comparison.
     const double envCycleSec = (double) attackSec + (double) decaySec + (double) releaseSec;
-    const bool retriggerOnWrap = tapeLoop.getLoopLengthSeconds() > envCycleSec * 1.15;
+    const double passSeconds = tapeLoop.getLoopLengthSeconds()
+                               / juce::jmax (0.25, (double) speedSmoothed.getCurrentValue());
+    const bool retriggerOnWrap = passSeconds > envCycleSec * 1.15;
 
     somnia::TapeDegrader::Params deg;
     deg.wear     = rawParams.wear->load();
@@ -368,12 +384,10 @@ void SomniaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     somnia::TapeLoop::Params tp;
     speedSmoothed.setTargetValue (std::pow (2.0f, rawParams.speed->load() / 12.0f));
-    tp.speed     = speedSmoothed.skip (numSamples);
+    tp.speed     = speedSmoothed.getCurrentValue();   // re-ramped per chunk below
     tp.feedback  = rawParams.feedback->load();
     tp.direction = (int) rawParams.direction->load();
     tp.playing   = tapeLoop.isPlaying() || loopAdsr.isActive();
-    tp.recording = tapeLoop.isRecording();
-    tp.overdub   = tapeLoop.hasContent();
     tp.splice    = rawParams.splice->load();
 
     // Musical grid for splices: one bar from the host tempo, shortened to half
@@ -401,15 +415,16 @@ void SomniaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     }
 
     // --- buffers -------------------------------------------------------------
-    auto ensure = [numSamples] (juce::AudioBuffer<float>& b)
+    // The scratch buffers were sized in prepareToPlay().  Growing them here is
+    // only a last-resort path for a host that ignores the samplesPerBlock it
+    // promised; it must never run in steady state, because setSize() allocates.
+    if (numSamples > bufferCapacity)
     {
-        if (b.getNumChannels() < 2 || b.getNumSamples() < numSamples)
-            b.setSize (2, numSamples, false, false, true);
-    };
-
-    ensure (loopBuffer);
-    ensure (wetBuffer);
-    ensure (outBuffer);
+        bufferCapacity = numSamples;
+        loopBuffer.setSize (2, bufferCapacity, false, false, true);
+        wetBuffer.setSize (2, bufferCapacity, false, false, true);
+        outBuffer.setSize (2, bufferCapacity, false, false, true);
+    }
 
     // The host input is kept untouched until the final write-back, so the dry
     // path can read it directly.  A separate dry copy used to cost a full
@@ -441,6 +456,12 @@ void SomniaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     for (int offset = 0; offset < numSamples; offset += chunkSize)
     {
         const int n = juce::jmin (chunkSize, numSamples - offset);
+
+        // The varispeed ramp is advanced per chunk instead of once per block:
+        // SLOW / FAST then glides through the chunk grid (64 samples) rather than
+        // stepping in whole host buffers, which was audible as a staircase pitch
+        // on large block sizes.
+        tp.speed = speedSmoothed.skip (n);
 
         tapeLoop.read (loopL + offset, loopR + offset, n, tp, rng);
 
@@ -492,6 +513,18 @@ void SomniaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
         tapeLoop.write (inL + offset, inR + offset,
                         loopL + offset, loopR + offset, n, tp);
+    }
+
+    // A free take that filled the whole tape stopped itself inside write().
+    // The transport parameter still says "Rec" and a same-value write would not
+    // be observable, so fall back to playback here: the take becomes audible and
+    // the next press of REC punches in over it instead of doing nothing.
+    if (tapeLoop.consumeTapeFull())
+    {
+        effectiveTransport = 1;
+        lastTransport = 1;
+        tapeLoop.startPlayback();
+        loopAdsr.noteOn();
     }
 
     // --- dry / wet + output --------------------------------------------------
@@ -562,14 +595,17 @@ void SomniaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             nonFinite = true;
             outL[i] = 0.0f;
             outR[i] = 0.0f;
+            continue;
         }
-        else
-        {
-            outL[i] = juce::jlimit (-1.0f, 1.0f, outL[i]);
-            outR[i] = juce::jlimit (-1.0f, 1.0f, outR[i]);
-            outPeak = juce::jmax (outPeak, juce::jmax (std::abs (outL[i]),
-                                                       std::abs (outR[i])));
-        }
+
+        // Measured before the safety clamp: afterwards the output can never
+        // exceed 1.0, so a threshold above it could never be reached and the
+        // OUT_HOT flag was dead.
+        outPeak = juce::jmax (outPeak, juce::jmax (std::abs (outL[i]),
+                                                  std::abs (outR[i])));
+
+        outL[i] = juce::jlimit (-1.0f, 1.0f, outL[i]);
+        outR[i] = juce::jlimit (-1.0f, 1.0f, outR[i]);
     }
 
     if (nonFinite)
@@ -586,7 +622,11 @@ void SomniaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     displayFreshRecording.store (tapeLoop.isFreshRecording() ? 1.0f : 0.0f,
                                  std::memory_order_relaxed);
     displayWear.store (deg.wear, std::memory_order_relaxed);
-    displayDropout.store (tapeDegrader.getDropoutGain(), std::memory_order_relaxed);
+    // A sample-and-hold keeps the output gain at unity (the effect is the
+    // freeze, not a gap), so the UI has to be told about the hold explicitly.
+    displayDropout.store (tapeDegrader.isHolding() ? 0.0f
+                                                  : tapeDegrader.getDropoutGain(),
+                          std::memory_order_relaxed);
     displayCycles.store (tapeLoop.getCycleCount(), std::memory_order_relaxed);
     displayDirection.store (tapeLoop.getDirectionSign(), std::memory_order_relaxed);
     displayRecording.store (tapeLoop.isRecording() ? 1.0f : 0.0f, std::memory_order_relaxed);
@@ -636,7 +676,13 @@ void SomniaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     if (nonFinite)                              snapshot.flags |= somnia::kFlagNonFinite;
     if (snapshot.inPeak > 2.0f)                 snapshot.flags |= somnia::kFlagInputHot;
-    if (snapshot.loopPeak > 4.0f)               snapshot.flags |= somnia::kFlagLoopHot;
+
+    // The read head can never exceed the tape's softClip ceiling (1.5), so the
+    // runaway-loop check has to look at what is written into the tape *before*
+    // clipping — that is the only place a feedback loop running away is visible.
+    const float tapeWritePeak = tapeLoop.consumeWritePeak();
+    if (tapeWritePeak > 4.0f)                   snapshot.flags |= somnia::kFlagLoopHot;
+
     if (snapshot.outPeak > 1.5f)                snapshot.flags |= somnia::kFlagOutHot;
     if (snapshot.grDb > 24.0f)                  snapshot.flags |= somnia::kFlagHeavyGR;
 

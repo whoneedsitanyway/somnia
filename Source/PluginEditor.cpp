@@ -162,9 +162,6 @@ void SomniaAudioProcessorEditor::updateTransportUi()
     recButton.setToggleState (recording, juce::dontSendNotification);
     playButton.setToggleState (playing && ! recording, juce::dontSendNotification);
     stopButton.setToggleState (! playing, juce::dontSendNotification);
-
-    lastRecording = recording;
-    lastPlaying = playing;
 }
 
 //==============================================================================
@@ -221,18 +218,26 @@ void SomniaAudioProcessorEditor::showSavePresetDialog()
     aw->addButton ("Save",   1, juce::KeyPress (juce::KeyPress::returnKey));
     aw->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
 
+    // The dialog outlives this editor: the host can close the window (or delete
+    // the editor) while it is modal, so the callback must not capture `this`.
+    juce::Component::SafePointer<SomniaAudioProcessorEditor> safeThis (this);
+
     aw->enterModalState (true, juce::ModalCallbackFunction::create (
-        [this, aw] (int result)
+        [safeThis, aw] (int result)
         {
-            if (result == 1)
+            if (result != 1)
+                return;
+
+            const auto name = aw->getTextEditorContents ("name").trim();
+
+            if (name.isEmpty() || safeThis == nullptr)
+                return;
+
+            if (safeThis->presetManager.savePreset (name))
             {
-                const auto name = aw->getTextEditorContents ("name").trim();
-                if (name.isNotEmpty() && presetManager.savePreset (name))
-                {
-                    processorRef.setLastPresetName (name);
-                    refreshPresets();
-                    presetBox.setText (name, juce::dontSendNotification);
-                }
+                safeThis->processorRef.setLastPresetName (name);
+                safeThis->refreshPresets();
+                safeThis->presetBox.setText (name, juce::dontSendNotification);
             }
         }), true);
 }

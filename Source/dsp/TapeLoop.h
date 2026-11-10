@@ -40,14 +40,14 @@ public:
         float speed      = 1.0f;    // playback rate (1.0 = normal)
         float feedback   = 0.55f;   // how much degraded loop is written back
         int   direction  = forward;
-        bool  playing    = false;
-        bool  recording  = false;
-        bool  overdub    = true;
+        bool  playing    = false;   // keeps the head running for the release tail
         float splice     = 0.0f;    // 0..1 read-head jump probability
         float phraseSeconds = 0.0f; // musical phrase length for splices (0 = loop / 2)
     };
 
     //==========================================================================
+    // Allocates the tape.  Only ever called from the message thread
+    // (prepareToPlay), so the full zero-fill here is fine.
     void prepare (double newSampleRate, double maxSeconds = 60.0)
     {
         sampleRate = newSampleRate > 0.0 ? newSampleRate : 48000.0;
@@ -61,24 +61,22 @@ public:
         reset();
     }
 
-    void reset()
+    // Leaves the tape empty and unwritten.  Does not touch the buffer memory:
+    // zeroing 60 seconds cannot be done on the audio thread (see clear()).
+    void reset() noexcept
     {
-        std::fill (bufferL.begin(), bufferL.end(), 0.0f);
-        std::fill (bufferR.begin(), bufferR.end(), 0.0f);
-
         loopLength   = 0.0;
         tapeLength   = 0.0;
         loopStart    = 0.0;
         targetLength = 0.0;
-        writePos     = 0.0;
+        writeIndex   = 0;
         readPos      = 0.0;
         dir          = 1;
-        lastDirection = forward;
+        lastDirection = kNoDirection;
         playing      = false;
         recording    = false;
         overdubMode  = true;
         freshRecording = false;
-        recordedOnce = false;
         tapeHasContent = false;
         freeMode     = true;
         cycleCount   = 0;
@@ -87,6 +85,10 @@ public:
         spliceCooldown = 0;
         lastPhraseIndex = -1;
         lastPhraseLen = 0.0;
+        writePeak   = 0.0f;
+        writtenEnd.store (0);
+
+        publishTapeLength();
     }
 
     //==========================================================================
@@ -112,6 +114,7 @@ public:
         loopStart = 0.0;
         loopLength = tapeLength;
         wrapPositions();
+        publishTapeLength();
     }
 
     // Sets the amount of recorded material without touching the loop window.
@@ -120,14 +123,23 @@ public:
     void setTapeLengthSeconds (double seconds)
     {
         const double maxSec = (double) maxSamples / sampleRate;
-        const double newLength = juce::jlimit (0.05, maxSec, seconds) * sampleRate;
+        const double newLength = std::round (juce::jlimit (0.05, maxSec, seconds)
+                                             * sampleRate);
 
         if (std::abs (newLength - tapeLength) < 0.5)
             return;
 
+        // A tempo change shortens the loop under a running head, so the wrapped
+        // position can jump by seconds.  Without a fade that is an audible click.
+        const double oldRead = readPos;
+
         tapeLength = juce::jmin (newLength, (double) maxSamples);
         clampLoopBounds();
         wrapPositions();
+        publishTapeLength();
+
+        if (playing && std::abs (readPos - oldRead) > 0.05 * sampleRate)
+            fadeGain = 0.0f;
     }
 
     // Loop window inside the recorded tape.  Both values are in seconds and are
@@ -138,8 +150,10 @@ public:
             return;
 
         const double tapeSec = tapeLength / sampleRate;
-        double s = juce::jlimit (0.0, tapeSec, startSeconds) * sampleRate;
-        double e = juce::jlimit (0.0, tapeSec, endSeconds) * sampleRate;
+        double s = std::round (juce::jlimit (0.0, tapeSec, startSeconds)
+                               * sampleRate);
+        double e = std::round (juce::jlimit (0.0, tapeSec, endSeconds)
+                               * sampleRate);
 
         // A full-range request (the common case while a free recording grows)
         // simply follows the tape end; do not reset the fade every block.
@@ -154,10 +168,11 @@ public:
             // While a free recording grows, the write head sits exactly at the
             // tape end; wrapping it would rewind the take to the start.
             keepHeadsInWindow (oldStart, oldLength, ! (freeMode && freshRecording));
+            publishTapeLength();
             return;
         }
 
-        const double minLen = (double) minLoopSamples();
+        const int minLen = juce::jmax (64, (int) (0.02 * sampleRate));
         if (e - s < minLen)
         {
             if (s + minLen <= tapeLength)
@@ -180,6 +195,7 @@ public:
         loopLength = e - s;
 
         keepHeadsInWindow (oldStart, oldLength, true);
+        publishTapeLength();
     }
 
     double getLoopLengthSeconds() const noexcept
@@ -200,11 +216,6 @@ public:
     double getTapeLengthSeconds() const noexcept
     {
         return sampleRate > 0.0 ? tapeLength / sampleRate : 0.0;
-    }
-
-    double getTargetLengthSeconds() const noexcept
-    {
-        return sampleRate > 0.0 ? targetLength / sampleRate : 0.0;
     }
 
     double getPositionNormalised() const noexcept
@@ -237,16 +248,19 @@ public:
         {
             freshRecording = true;
             tapeHasContent = false;
-            writePos = 0.0;
+            writeIndex = 0;
             readPos  = 0.0;
             dir      = 1;
+            lastDirection = kNoDirection;  // force direction re-evaluation on next read
             cycleCount = 0;
+            writtenEnd.store (0);   // a fresh take erases the tape from the top
 
             if (freeMode)
             {
                 tapeLength = 0.0;
                 loopStart  = 0.0;
                 loopLength = 0.0;
+                publishTapeLength();
             }
             else
             {
@@ -259,6 +273,7 @@ public:
                 loopStart = 0.0;
                 loopLength = tapeLength;
                 targetLength = tapeLength;
+                publishTapeLength();
             }
         }
         else
@@ -276,12 +291,11 @@ public:
 
         if (freeMode && freshRecording)
         {
-            if (writePos >= (double) minLoopSamples())
+            if (writeIndex >= (int) minLoopSamples())
             {
-                tapeLength = writePos;
+                tapeLength = writeIndex;
                 loopStart = 0.0;
                 loopLength = tapeLength;
-                recordedOnce = true;
             }
             else
             {
@@ -290,22 +304,36 @@ public:
                 loopLength = 0.0;
                 tapeHasContent = false;
             }
+
+            publishTapeLength();
         }
+
+        // writtenEnd is an absolute buffer index: everything at or beyond it has
+        // never been recorded since the last erase.  copyWaveform clamps it to
+        // the tape length, so keeping the largest value is safe.
+        writtenEnd.store (juce::jmax (writtenEnd.load(),
+                                      (int) (loopStart + loopLength)));
 
         freshRecording = false;
     }
 
-    void clear()
+    // Erases the tape.  Deliberately does NOT touch the buffer memory: 60
+    // seconds of stereo float is ~23 MB at 48 kHz and ~92 MB at 192 kHz, and a
+    // fill of that size cannot run inside a processBlock.  Instead the tape is
+    // marked as holding nothing (writtenEnd = 0), which makes every read of
+    // never-written material return silence, and the stale samples are
+    // overwritten as soon as the next take runs.
+    void clear() noexcept
     {
-        std::fill (bufferL.begin(), bufferL.end(), 0.0f);
-        std::fill (bufferR.begin(), bufferR.end(), 0.0f);
         tapeLength = 0.0;
         loopStart = 0.0;
         loopLength = 0.0;
-        writePos = 0.0;
+        targetLength = 0.0;
+        writeIndex = 0;
         readPos = 0.0;
+        dir = 1;
+        lastDirection = kNoDirection;
         cycleCount = 0;
-        recordedOnce = false;
         tapeHasContent = false;
         freshRecording = false;
         recording = false;
@@ -315,6 +343,11 @@ public:
         spliceCooldown = 0;
         lastPhraseIndex = -1;
         lastPhraseLen = 0.0;
+        writePeak = 0.0f;
+        writtenEnd.store (0);
+
+        publishTapeLength();
+        writeVersion.fetch_add (1, std::memory_order_relaxed);
     }
 
     //==========================================================================
@@ -360,16 +393,38 @@ public:
         return writeVersion.load (std::memory_order_relaxed);
     }
 
+    // Highest absolute buffer index that holds written material.  Everything at
+    // or beyond it has never been recorded since the last erase, so it reads as
+    // silence; the tape map must not show it either.
+    int getWrittenEnd() const noexcept { return writtenEnd; }
+
+    // Peak of the values handed to the tape *before* softClip, accumulated since
+    // the last call.  This is what a runaway feedback loop actually looks like:
+    // after softClip the tape can never exceed 1.5, so a post-clip peak could
+    // never report a problem.
+    float consumeWritePeak() noexcept
+    {
+        const float p = writePeak;
+        writePeak = 0.0f;
+        return p;
+    }
+
     // Fills minOut/maxOut with a decimated min/max envelope of the whole
     // recorded tape.  Called from the message thread for the loop editor; the
     // buffer is only ever resized in prepare(), so this is safe enough for a
     // visualisation (a sample may be caught mid-write, which is harmless).
+    // The length is read from the published copy so the UI can never see a
+    // value that is out of sync with the audio thread's bounds checks.
     void copyWaveform (float* minOut, float* maxOut, int numBuckets) const
     {
         if (minOut == nullptr || maxOut == nullptr || numBuckets <= 0)
             return;
 
-        const int n = juce::jlimit (0, maxSamples, (int) tapeLength);
+        const int written = juce::jmin (writtenEnd.load (std::memory_order_relaxed),
+                                        maxSamples);
+        const int length  = juce::jlimit (0, maxSamples,
+                                          (int) tapeLengthForUI.load (std::memory_order_relaxed));
+        const int n = juce::jmin (length, written);
 
         for (int b = 0; b < numBuckets; ++b)
         {
@@ -437,7 +492,11 @@ public:
 
         const double len   = loopLength;
         const double start = loopStart;
-        const double speed = juce::jlimit (0.25, 4.0, (double) p.speed);
+        const int    base  = (int) loopStart;
+        const int    n     = (int) loopLength;
+        const int    written = writtenEnd.load (std::memory_order_relaxed);
+        const double speed = std::isfinite ((double) p.speed)
+                                 ? juce::jlimit (0.25, 4.0, (double) p.speed) : 1.0;
         const int requestedDirection = juce::jlimit (0, 3, p.direction);
 
         if (requestedDirection != lastDirection)
@@ -484,8 +543,13 @@ public:
             else if (requestedDirection == reverse)
                 dir = -1;
 
-            const float l = readCubic (bufferL, start + readPos, start, len);
-            const float r = readCubic (bufferR, start + readPos, start, len);
+            // Material that has never been written since the last erase reads as
+            // silence.  This is what makes clear() real-time safe: the buffer is
+            // not zeroed, it is simply declared empty.
+            float l = 0.0f, r = 0.0f;
+
+            if (start + readPos + 2.0 < (double) written)
+                readCubicPair (bufferL.data(), bufferR.data(), base, n, readPos, l, r);
 
             outL[i] = l * fadeGain;
             outR[i] = r * fadeGain;
@@ -529,11 +593,17 @@ public:
             else if (readPos >= len)
             {
                 readPos -= len;
+
+                // The join between the end and the start of a tape loop is a
+                // physical splice, and the two samples either side of it are
+                // unrelated: without a short fade every pass started with a click.
+                fadeGain = 0.0f;
                 onWrap (requestedDirection, rng);
             }
             else if (readPos < 0.0)
             {
                 readPos += len;
+                fadeGain = 0.0f;
                 onWrap (requestedDirection, rng);
             }
 
@@ -597,11 +667,13 @@ public:
             return;
 
         const float fb = juce::jlimit (0.0f, 0.95f, p.feedback);
+        const int windowLen = (int) loopLength;   // window is whole samples
+        const int base = (int) loopStart;
+        int written = writtenEnd.load (std::memory_order_relaxed);
 
         for (int i = 0; i < numSamples; ++i)
         {
-            const int wi = juce::jlimit (0, maxSamples - 1,
-                                         (int) (loopStart + writePos));
+            const int wi = base + writeIndex;
 
             const float inl = inL != nullptr ? inL[i] : 0.0f;
             const float inr = inR != nullptr ? inR[i] : 0.0f;
@@ -620,34 +692,58 @@ public:
             if (! std::isfinite (nl)) nl = 0.0f;
             if (! std::isfinite (nr)) nr = 0.0f;
 
+            // Peak before softClip: the only place a runaway loop is visible.
+            writePeak = juce::jmax (writePeak, juce::jmax (std::abs (nl),
+                                                           std::abs (nr)));
+
             bufferL[(size_t) wi] = softClip (nl);
             bufferR[(size_t) wi] = softClip (nr);
             tapeHasContent = true;
 
+            if (wi >= written)
+                written = wi + 1;   // extends the "actually recorded" region
+
             if (freeMode && freshRecording)
             {
-                writePos += 1.0;
-                tapeLength = juce::jmin ((double) maxSamples, writePos);
+                ++writeIndex;
+                tapeLength = writeIndex;
                 loopLength = tapeLength;
 
-                if (writePos >= (double) maxSamples)
+                if (writeIndex >= maxSamples)
                 {
-                    // The tape is full: stop automatically.
+                    // The tape is full: stop automatically.  The processor has
+                    // to learn about this, otherwise a repeated REC (which
+                    // carries the same transport value) would look like "already
+                    // recording" and never restart.
                     recording = false;
                     freshRecording = false;
-                    recordedOnce = true;
+                    tapeFull = true;
                     break;
                 }
             }
             else
             {
-                writePos += 1.0;
-                if (writePos >= loopLength)
-                    writePos -= loopLength;
+                ++writeIndex;
+                if (writeIndex >= windowLen)
+                    writeIndex = 0;
             }
         }
 
+        writtenEnd.store (written, std::memory_order_relaxed);
+
+        if (freeMode && freshRecording)
+            publishTapeLength();
+
         writeVersion.fetch_add (1, std::memory_order_relaxed);
+    }
+
+    // True once a free recording has filled the tape and stopped itself.  The
+    // processor uses it to re-apply the transport so REC stays usable.
+    bool consumeTapeFull() noexcept
+    {
+        const bool was = tapeFull;
+        tapeFull = false;
+        return was;
     }
 
 private:
@@ -674,6 +770,16 @@ private:
         wrapFlag = true;
     }
 
+    // Publishes the geometry the UI reads.  copyWaveform() runs on the message
+    // thread and cannot touch tapeLength/loopStart/loopLength directly: they are
+    // written by the audio thread while a free recording grows.
+    void publishTapeLength() noexcept
+    {
+        const int end = (int) (loopStart + loopLength);
+        tapeLengthForUI.store (juce::jlimit (0, maxSamples, end),
+                               std::memory_order_relaxed);
+    }
+
     void wrapPositions() noexcept
     {
         if (loopLength <= 0.0)
@@ -683,24 +789,28 @@ private:
         if (readPos < 0.0)
             readPos += loopLength;
 
-        writePos = std::fmod (writePos, loopLength);
-        if (writePos < 0.0)
-            writePos += loopLength;
+        const int len = (int) loopLength;
+        if (len > 0)
+        {
+            while (writeIndex < 0)   writeIndex += len;
+            while (writeIndex >= len) writeIndex -= len;
+        }
     }
 
     // Applies a change of the loop window without moving the material under the
-    // heads.  readPos/writePos are relative to loopStart, so a window move has
-    // to be compensated; otherwise every drag step plays a different part of
-    // the tape.  The fade is only restarted on a real jump: a smooth drag
-    // changes the window once per block, and resetting the gain that often
-    // turned into an audible amplitude modulation ("stuttering" while a marker
-    // was dragged).
-    void keepHeadsInWindow (double oldStart, double oldLength, bool wrapWrite) noexcept
+    // heads.  readPos/writeIndex are relative to loopStart, so a window move has
+    // to be compensated on *both* heads; otherwise every drag step plays (and
+    // records) a different part of the tape.  The fade is only restarted on a
+    // real jump: a smooth drag changes the window once per block, and resetting
+    // the gain that often turned into an audible amplitude modulation
+    // ("stuttering" while a marker was dragged).
+    void keepHeadsInWindow (double oldStart, double oldLength, bool relocateWrite) noexcept
     {
         if (loopLength <= 0.0)
             return;
 
-        readPos -= (loopStart - oldStart);
+        const double shift = loopStart - oldStart;
+        readPos -= shift;
 
         const bool jumped = readPos < 0.0 || readPos >= loopLength;
 
@@ -711,11 +821,18 @@ private:
                 readPos += loopLength;
         }
 
-        if (wrapWrite)
+        // The same compensation for the record head, then a wrap into the new
+        // window (shrinking the loop must not leave the head outside it).
+        if (relocateWrite)
         {
-            writePos = std::fmod (writePos, loopLength);
-            if (writePos < 0.0)
-                writePos += loopLength;
+            double wp = std::fmod ((double) writeIndex - shift, loopLength);
+            if (wp < 0.0)
+                wp += loopLength;
+            writeIndex = (int) wp;
+        }
+        else
+        {
+            writeIndex = juce::jlimit (0, juce::jmax (0, (int) loopLength - 1), writeIndex);
         }
 
         if (jumped || std::abs (loopLength - oldLength) > 0.05 * sampleRate)
@@ -759,44 +876,82 @@ private:
         }
     }
 
-    static float readCubic (const std::vector<float>& buf, double pos,
-                            double start, double len) noexcept
+    // Absolute index of `abs` wrapped into the window [base, base+n).  Read
+    // positions live in [0, n), so only the four interpolation taps can leave
+    // the window and a single correction is enough (a modulo per tap showed up
+    // in the profile next to the tape itself).
+    static int wrapIndex (int abs, int base, int n) noexcept
     {
-        const int n = (int) len;
-        if (n <= 0)
-            return 0.0f;
+        int rel = abs - base;
 
-        const int base = (int) start;
+        if (rel < 0)
+            rel += n;
+        else if (rel >= n)
+            rel -= n;
+
+        if (rel < 0)
+            rel = 0;
+        else if (rel >= n)
+            rel = n - 1;
+
+        return base + rel;
+    }
+
+    // Catmull-Rom interpolation of both channels.  The window is
+    // [base, base+n) with whole-sample bounds.
+    static void readCubicPair (const float* bufL, const float* bufR,
+                               int base, int n, double pos,
+                               float& outL, float& outR) noexcept
+    {
+        if (n <= 0)
+        {
+            outL = outR = 0.0f;
+            return;
+        }
+
         const int i1 = (int) std::floor (pos);
         const float frac = (float) (pos - (double) i1);
 
-        auto at = [n, base] (int i) noexcept
-        {
-            int rel = i - base;
-            rel %= n;
-            if (rel < 0)
-                rel += n;
-            return base + rel;
-        };
-
         if (n < 4)
         {
-            const float y0 = buf[(size_t) at (i1)];
-            const float y1 = buf[(size_t) at (i1 + 1)];
-            return y0 + (y1 - y0) * frac;
+            auto at = [n, base] (int i) noexcept
+            {
+                int rel = (i - base) % n;
+                if (rel < 0)
+                    rel += n;
+                return base + rel;
+            };
+
+            const float a0 = bufL[(size_t) at (i1)];
+            const float a1 = bufL[(size_t) at (i1 + 1)];
+            const float b0 = bufR[(size_t) at (i1)];
+            const float b1 = bufR[(size_t) at (i1 + 1)];
+
+            outL = a0 + (a1 - a0) * frac;
+            outR = b0 + (b1 - b0) * frac;
+            return;
         }
 
-        const float y0 = buf[(size_t) at (i1 - 1)];
-        const float y1 = buf[(size_t) at (i1)];
-        const float y2 = buf[(size_t) at (i1 + 1)];
-        const float y3 = buf[(size_t) at (i1 + 2)];
+        const int im1 = wrapIndex (i1 - 1, base, n);
+        const int i0  = wrapIndex (i1,     base, n);
+        const int ip1 = wrapIndex (i1 + 1, base, n);
+        const int ip2 = wrapIndex (i1 + 2, base, n);
 
-        const float c0 = y1;
-        const float c1 = 0.5f * (y2 - y0);
-        const float c2 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
-        const float c3 = 0.5f * (y3 - y0) + 1.5f * (y1 - y2);
+        const float yl0 = bufL[(size_t) im1], yl1 = bufL[(size_t) i0];
+        const float yl2 = bufL[(size_t) ip1], yl3 = bufL[(size_t) ip2];
+        const float c0L = yl1;
+        const float c1L = 0.5f * (yl2 - yl0);
+        const float c2L = yl0 - 2.5f * yl1 + 2.0f * yl2 - 0.5f * yl3;
+        const float c3L = 0.5f * (yl3 - yl0) + 1.5f * (yl1 - yl2);
+        outL = ((c3L * frac + c2L) * frac + c1L) * frac + c0L;
 
-        return ((c3 * frac + c2) * frac + c1) * frac + c0;
+        const float yr0 = bufR[(size_t) im1], yr1 = bufR[(size_t) i0];
+        const float yr2 = bufR[(size_t) ip1], yr3 = bufR[(size_t) ip2];
+        const float c0R = yr1;
+        const float c1R = 0.5f * (yr2 - yr0);
+        const float c2R = yr0 - 2.5f * yr1 + 2.0f * yr2 - 0.5f * yr3;
+        const float c3R = 0.5f * (yr3 - yr0) + 1.5f * (yr1 - yr2);
+        outR = ((c3R * frac + c2R) * frac + c1R) * frac + c0R;
     }
 
     static float softClip (float x) noexcept
@@ -809,6 +964,10 @@ private:
     }
 
     //==========================================================================
+    // startRecording() uses it to tell "the loop has never played in this
+    // direction" from "the direction did not change".
+    static constexpr int kNoDirection = 0;
+
     double sampleRate = 48000.0;
     int    maxSamples = 0;
 
@@ -818,20 +977,26 @@ private:
     double loopStart    = 0.0;   // offset of the loop window inside the tape
     double loopLength   = 0.0;   // length of the loop window
     double targetLength = 0.0;
-    double writePos     = 0.0;
+
+    // Whole-sample window geometry makes the read wrap and the buffer addressing
+    // exact; readPos is relative to loopStart, writeIndex is the record head
+    // inside the window.
+    int    writeIndex   = 0;
     double readPos      = 0.0;
 
     int  dir = 1;
-    int  lastDirection = forward;
+    int  lastDirection = kNoDirection;
 
-    bool playing         = false;
-    bool recording       = false;
-    bool overdubMode     = true;
-    bool freshRecording  = false;
-    bool recordedOnce    = false;
-    bool tapeHasContent  = false;
-    bool freeMode        = true;
-    bool wrapFlag        = false;
+    bool playing        = false;
+    bool recording      = false;
+    bool overdubMode    = true;
+    bool freshRecording = false;
+    bool tapeHasContent = false;
+    bool freeMode       = true;
+    bool wrapFlag       = false;
+
+    // Set by write() when a free recording filled the tape and stopped itself.
+    bool tapeFull       = false;
 
     int   cycleCount     = 0;
     float fadeGain       = 1.0f;
@@ -841,7 +1006,18 @@ private:
     int    lastPhraseIndex = -1;
     double lastPhraseLen   = 0.0;
 
+    // Peak of the *unclipped* signal written into the tape since the last
+    // consumeWritePeak(): the loop can only be measured before softClip().
+    float writePeak = 0.0f;
+
     std::atomic<std::uint32_t> writeVersion { 0 };
+
+    // End of the actually recorded region in absolute samples.  The message
+    // thread reads it for the waveform, so it has to be atomic.
+    std::atomic<int> writtenEnd { 0 };
+
+    // Published geometry for the waveform (loopStart + loopLength in samples).
+    std::atomic<int> tapeLengthForUI { 0 };
 };
 
 } // namespace somnia

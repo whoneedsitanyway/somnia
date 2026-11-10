@@ -43,6 +43,8 @@ int main()
     layout.add (std::make_unique<juce::AudioParameterFloat> ("wear", "Wear", 0.0f, 1.0f, 0.35f));
     layout.add (std::make_unique<juce::AudioParameterChoice> ("direction", "Direction",
                  juce::StringArray { "Forward", "Reverse", "Ping-Pong", "Random" }, 0));
+    layout.add (std::make_unique<juce::AudioParameterChoice> ("transport", "Transport",
+                 juce::StringArray { "Stop", "Play", "Rec" }, 0));
 
     juce::AudioProcessorValueTreeState apvts (proc, nullptr, "PARAMETERS", std::move (layout));
 
@@ -84,6 +86,31 @@ int main()
                        && std::abs (wear - 0.81f) < 0.001f
                        && std::abs (dir - 2.0f) < 0.01f;
 
+    // --- non-ASCII preset names ---------------------------------------------
+    // sanitise() used to keep ASCII only, so a name in another script became an
+    // empty string and saving failed silently.
+    const juce::String unicodeName = juce::String::fromUTF8 ("Меланхолия \u00c4");
+    const bool unicodeSaved = pm.savePreset (unicodeName);
+    const bool unicodeListed = pm.getPresetNames().contains (unicodeName);
+    setVal ("wear", 0.11f);
+    const bool unicodeLoaded = pm.loadPreset (unicodeName);
+    const bool unicodeOk = unicodeSaved && unicodeListed && unicodeLoaded
+                        && std::abs (getVal ("wear") - 0.81f) < 0.001f;
+
+    // --- the transport must not travel inside a preset -----------------------
+    // Loading a preset used to restore the transport, which could start a
+    // recording (or stop playback) just because a sound was selected.
+    setVal ("transport", 2.0f);   // Rec
+    const bool transportSaved = pm.savePreset ("Transport Test");
+    const auto transportFile = tmpDir.getChildFile (juce::String ("Transport Test") + PresetManager::extension);
+    const bool transportAbsent = transportFile.existsAsFile()
+                              && ! transportFile.loadFileAsString().contains ("id=\"transport\"");
+
+    setVal ("transport", 0.0f);
+    const bool transportLoaded = pm.loadPreset ("Transport Test");
+    const bool transportOk = transportSaved && transportAbsent && transportLoaded
+                          && std::abs (getVal ("transport") - 0.0f) < 0.01f;
+
     tmpDir.deleteRecursively();
 
     // --- factory presets -----------------------------------------------------
@@ -104,10 +131,12 @@ int main()
 
     std::cout << "saved=" << saved << " listed=" << listed << " loaded=" << loaded
               << " mix=" << mix << " len=" << len << " wear=" << wear << " dir=" << dir
+              << " unicode=" << unicodeOk << " transport=" << transportOk
               << " factory=" << factory.size() << " factoryOk=" << factoryOk
               << " factoryXmlOk=" << factoryXmlOk << std::endl;
 
-    if (! (saved && listed && loaded && valuesOk && factoryOk && factoryXmlOk))
+    if (! (saved && listed && loaded && valuesOk && unicodeOk && transportOk
+           && factoryOk && factoryXmlOk))
     {
         std::cout << "FAIL: preset round-trip" << std::endl;
         return 1;

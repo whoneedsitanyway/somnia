@@ -400,6 +400,261 @@ int main()
                       << " worstRms=" << worstRms << std::endl;
     }
 
+    //==========================================================================
+    //  Regressions
+    //==========================================================================
+
+    // --- clear() must be RT-safe but still silence the tape ------------------
+    // It used to std::fill 23..92 MB inside processBlock.  The tape is now
+    // declared empty instead of zeroed, so the old samples stay in the buffer
+    // and must never be read back.
+    bool clearSilentOk = true;
+    {
+        somnia::TapeLoop t;
+        t.prepare (sr, 4.0);
+        t.setFreeMode (true);
+        t.startRecording (false);
+
+        double ph = 0.0;
+        for (int b = 0; b < recordBlocks; ++b)
+        {
+            for (int i = 0; i < block; ++i)
+            {
+                const float s = (float) (0.5 * std::sin (ph + 2.0 * juce::MathConstants<double>::pi
+                                                              * 440.0 * (double) i / sr));
+                inL[(size_t) i] = s;
+                inR[(size_t) i] = s;
+            }
+            ph += 2.0 * juce::MathConstants<double>::pi * 440.0 * block / sr;
+            t.write (inL.data(), inR.data(), nullptr, nullptr, block, p);
+        }
+        t.stopRecording();
+
+        const int writtenBefore = t.getWrittenEnd();
+        t.clear();
+
+        clearSilentOk = writtenBefore > (int) (0.9 * sr)
+                     && t.getWrittenEnd() == 0
+                     && ! t.hasContent()
+                     && t.getLoopLengthSeconds() == 0.0
+                     && t.getCycleCount() == 0;
+
+        // Playing an erased tape must be silent even though the buffer still
+        // holds the previous take.
+        t.startPlayback();
+        somnia::TapeLoop::Params q;
+        q.direction = somnia::TapeLoop::forward;
+        q.speed = 1.0f;
+        t.read (outL.data(), outR.data(), block, q, rng);
+
+        float peakAfterClear = 0.0f;
+        for (int i = 0; i < block; ++i)
+            peakAfterClear = juce::jmax (peakAfterClear, std::abs (outL[(size_t) i]));
+
+        clearSilentOk = clearSilentOk && peakAfterClear < 1.0e-7f;
+
+        // ...and a new take after clear starts from the top again.
+        t.startRecording (false);
+        ph = 0.0;
+        for (int b = 0; b < recordBlocks; ++b)
+        {
+            for (int i = 0; i < block; ++i)
+            {
+                const float s = (float) (0.5 * std::sin (ph + 2.0 * juce::MathConstants<double>::pi
+                                                              * 440.0 * (double) i / sr));
+                inL[(size_t) i] = s;
+                inR[(size_t) i] = s;
+            }
+            ph += 2.0 * juce::MathConstants<double>::pi * 440.0 * block / sr;
+            t.write (inL.data(), inR.data(), nullptr, nullptr, block, p);
+        }
+        t.stopRecording();
+
+        clearSilentOk = clearSilentOk
+                     && std::abs (t.getLoopLengthSeconds() - 1.0) < 0.02
+                     && t.getWrittenEnd() > (int) (0.9 * sr);
+
+        if (! clearSilentOk)
+            std::cout << "clear: writtenBefore=" << writtenBefore
+                      << " written=" << t.getWrittenEnd()
+                      << " peak=" << peakAfterClear << std::endl;
+    }
+
+    // --- moving the loop window must move the record head with it ------------
+    // keepHeadsInWindow() compensated the read head only, so after a window move
+    // the record head stayed at the same window-relative index and punched in
+    // half a window away from the material it was actually pointing at.
+    bool windowWriteOk = true;
+    {
+        somnia::TapeLoop t;
+        t.prepare (sr, 4.0);
+        t.setFreeMode (true);
+        t.startRecording (false);
+
+        // A rising ramp makes every material position identifiable.
+        const float rampStep = 1.0f / (float) (recordBlocks * block);
+        float ramp = 0.0f;
+
+        for (int b = 0; b < recordBlocks; ++b)
+        {
+            for (int i = 0; i < block; ++i)
+            {
+                inL[(size_t) i] = ramp;
+                inR[(size_t) i] = ramp;
+                ramp += rampStep;
+            }
+            t.write (inL.data(), inR.data(), nullptr, nullptr, block, p);
+        }
+        t.stopRecording();
+
+        const int tapeSamples = t.getWrittenEnd();   // the head sits at the end
+
+        // Window [0.1, 0.5] of the tape.
+        t.setLoopBoundsSeconds (0.10, 0.50);
+
+        // Punch in a negative block (feedback off, so only the input is written).
+        somnia::TapeLoop::Params rec;
+        rec.feedback = 0.0f;
+        for (int i = 0; i < block; ++i)
+        {
+            inL[(size_t) i] = -0.5f;
+            inR[(size_t) i] = -0.5f;
+        }
+        t.startRecording (true);
+        t.write (inL.data(), inR.data(), nullptr, nullptr, block, rec);
+        t.stopRecording();
+
+        // Look at the whole tape again and locate the overwritten block.
+        t.setLoopBoundsSeconds (0.0, 1.0);
+
+        constexpr int buckets = 100;
+        std::vector<float> mn ((size_t) buckets), mx ((size_t) buckets);
+        t.copyWaveform (mn.data(), mx.data(), buckets);
+
+        int hit = -1;
+        for (int i = 0; i < buckets; ++i)
+            if (mn[(size_t) i] < -0.2f)
+                hit = i;
+
+        // The record head must keep pointing at the same material: the take ends
+        // at `tapeSamples`, and that position wraps into the new window.
+        const double winStart = 0.10 * sr;
+        const double winLen   = 0.40 * sr;
+        const double expectedIndex = winStart
+                                   + std::fmod ((double) tapeSamples - winStart, winLen);
+        const float expectedNorm = (float) (expectedIndex / (double) tapeSamples);
+
+        const float hitNorm = hit >= 0 ? ((float) hit + 0.5f) / (float) buckets : -1.0f;
+        windowWriteOk = std::abs (hitNorm - expectedNorm) < 0.03f;
+
+        if (! windowWriteOk)
+            std::cout << "window write: hit=" << hit
+                      << " norm=" << hitNorm
+                      << " expected=" << expectedNorm
+                      << " written=" << tapeSamples << std::endl;
+    }
+
+    // --- REVERSE after a fresh take must play backwards ----------------------
+    // startRecording() reset the head but not lastDirection, so a take started
+    // while the direction was already latched to reverse played forwards.
+    bool reverseFreshOk = true;
+    {
+        somnia::TapeLoop t;
+        t.prepare (sr, 4.0);
+        t.setFreeMode (true);
+
+        const float rampStep = 1.0f / (float) (recordBlocks * block);
+        float ramp = 0.0f;
+
+        t.startRecording (false);
+        for (int b = 0; b < recordBlocks; ++b)
+        {
+            for (int i = 0; i < block; ++i)
+            {
+                inL[(size_t) i] = ramp;
+                inR[(size_t) i] = ramp;
+                ramp += rampStep;
+            }
+            t.write (inL.data(), inR.data(), nullptr, nullptr, block, p);
+        }
+        t.stopRecording();
+        t.startPlayback();
+
+        somnia::TapeLoop::Params rp;
+        rp.direction = somnia::TapeLoop::reverse;
+        rp.speed = 1.0f;
+
+        // Latch the direction to reverse on the old take.
+        for (int b = 0; b < 8; ++b)
+            t.read (outL.data(), outR.data(), block, rp, rng);
+
+        // Brand-new take of the same ramp.
+        ramp = 0.0f;
+        t.startRecording (false);
+        for (int b = 0; b < recordBlocks; ++b)
+        {
+            for (int i = 0; i < block; ++i)
+            {
+                inL[(size_t) i] = ramp;
+                inR[(size_t) i] = ramp;
+                ramp += rampStep;
+            }
+            t.write (inL.data(), inR.data(), nullptr, nullptr, block, p);
+        }
+        t.stopRecording();
+        t.startPlayback();
+
+        // The first block must read the *end* of the ramp: the head starts at 0
+        // and immediately wraps backwards.
+        t.read (outL.data(), outR.data(), block, rp, rng);
+
+        float firstPeak = 0.0f;
+        for (int i = 0; i < block; ++i)
+            firstPeak = juce::jmax (firstPeak, std::abs (outL[(size_t) i]));
+
+        reverseFreshOk = firstPeak > 0.5f;
+
+        if (! reverseFreshOk)
+            std::cout << "reverse after fresh take: firstPeak=" << firstPeak << std::endl;
+    }
+
+    // --- a full tape stops itself and REC becomes usable again ---------------
+    // write() cleared the recording flag but the processor still saw the same
+    // transport value, so the next press of REC did nothing.
+    bool tapeFullOk = true;
+    {
+        somnia::TapeLoop t;
+        t.prepare (sr, 1.0);   // prepare() keeps at least one second
+        t.setFreeMode (true);
+        t.startRecording (false);
+
+        for (int b = 0; b < 200; ++b)   // 2 s of input into a 1 s tape
+            t.write (inL.data(), inR.data(), nullptr, nullptr, block, p);
+
+        const bool stopped    = ! t.isRecording();
+        const bool fullFlag   = t.consumeTapeFull();
+        const bool fullLength = std::abs (t.getLoopLengthSeconds() - 1.0) < 0.02;
+        const bool content    = t.hasContent();
+
+        // The processor turns the flag into a PLAY state; REC must work again.
+        t.startRecording (true);
+        const bool restarted = t.isRecording();
+        t.write (inL.data(), inR.data(), nullptr, nullptr, block, p);
+        const bool noStaleFlag = ! t.consumeTapeFull();
+
+        tapeFullOk = stopped && fullFlag && fullLength && content
+                  && restarted && noStaleFlag;
+
+        if (! tapeFullOk)
+            std::cout << "tape full: stopped=" << stopped << " flag=" << fullFlag
+                      << " len=" << t.getLoopLengthSeconds()
+                      << " restarted=" << restarted << std::endl;
+    }
+
+    std::cout << "clearRT=" << clearSilentOk << " windowWrite=" << windowWriteOk
+              << " revFresh=" << reverseFreshOk << " tapeFull=" << tapeFullOk
+              << std::endl;
+
     std::cout << "freeLen=" << freeLen << " syncLen=" << syncLen
               << " peak=" << peak << " cycles=" << tape.getCycleCount()
               << " free=" << freeOk << " playback=" << playbackOk
@@ -416,7 +671,8 @@ int main()
     if (! (freeOk && playbackOk && dirsOk && cyclesOk && pingPongOk && pingAudible
            && longPingOk && dragOk
            && syncOk && boundsOk && silent && nanOk && tailAudible && tailSilent
-           && clearOk))
+           && clearOk
+           && clearSilentOk && windowWriteOk && reverseFreshOk && tapeFullOk))
     {
         std::cout << "FAIL: tape loop" << std::endl;
         return 1;

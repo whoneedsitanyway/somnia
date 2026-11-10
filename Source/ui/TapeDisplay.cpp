@@ -694,7 +694,10 @@ float TapeDisplay::minNorm() const
     if (tape <= 0.0f)
         return 0.05f;
 
-    return juce::jlimit (0.002f, 0.5f, 0.05f / tape);   // 50 ms
+    // 50 ms expressed as a fraction of the tape.  The lower bound only stops a
+    // degenerate value; it used to be 0.002, which silently turned the 50 ms
+    // minimum into 120 ms on a 60 s tape.
+    return juce::jlimit (0.0005f, 0.5f, 0.05f / tape);
 }
 
 int TapeDisplay::markerAt (float x) const
@@ -707,11 +710,15 @@ int TapeDisplay::markerAt (float x) const
     const float sx = xAt (start);
     const float ex = xAt (end);
 
+    // Nearest marker wins.  Checking START first made the END handle unreachable
+    // whenever the loop was shorter than the 2 * tolerance window: the two
+    // handles overlap and START always answered.
     const float tolerance = 10.0f;
-    if (std::abs (x - sx) <= tolerance)
-        return 0;
-    if (std::abs (x - ex) <= tolerance)
-        return 1;
+    const float ds = std::abs (x - sx);
+    const float de = std::abs (x - ex);
+
+    if (ds <= tolerance || de <= tolerance)
+        return ds <= de ? 0 : 1;
 
     const float n = normAt (x);
     if (n > start && n < end)
@@ -785,8 +792,10 @@ void TapeDisplay::drawEnvelope (juce::Graphics& g, juce::Rectangle<float> area) 
     const auto textDim = findColour (SomniaLookAndFeel::textDimColourId);
 
     // Without any material the wet path is silent, so an envelope that the DSP
-    // keeps running would be a false indicator: show it as idle.
-    const bool hasTape = proc.getDisplayHasContent();
+    // keeps running would be a false indicator: show it as idle.  A fresh take is
+    // the same case — the read head is idle and nothing is audible yet.
+    const bool hasTape = proc.getDisplayHasContent()
+                      && ! proc.getDisplayFreshRecording();
     const float level = hasTape ? juce::jlimit (0.0f, 1.0f, proc.getDisplayEnvelopeLevel())
                                 : 0.0f;
     const int   stage = hasTape ? proc.getDisplayEnvelopeStage() : 0;
@@ -1011,6 +1020,9 @@ void TapeDisplay::rebuildWaveImage() const
     // bar of ceil(w / kBuckets) px makes the wave a solid, readable shape.
     const int barW = juce::jmax (1, (int) std::ceil ((float) w / (float) kBuckets));
 
+    // Set once: setColour() per bar meant 1024 state changes per rebuild.
+    ig.setColour (accent.withAlpha (0.88f));
+
     for (int i = 0; i < kBuckets; ++i)
     {
         const float n = ((float) i + 0.5f) / (float) kBuckets;
@@ -1022,7 +1034,6 @@ void TapeDisplay::rebuildWaveImage() const
         const int top = juce::roundToInt (juce::jmin (y1, y2));
         const int bot = juce::roundToInt (juce::jmax (y1, y2));
 
-        ig.setColour (accent.withAlpha (0.88f));
         ig.fillRect (juce::Rectangle<int> (x, top, barW, juce::jmax (1, bot - top)));
     }
 
@@ -1124,16 +1135,25 @@ void TapeDisplay::drawWave (juce::Graphics& g) const
         drawWavePrediction (g, pulseProgress(), pulseTint());
 
         // --- dim everything outside the loop window --------------------------
+        // Clipped to the rounded scope: plain rectangles painted over the
+        // corners and read as the panel being cut off.
         const float sx = xAt (start);
         const float ex = xAt (end);
 
-        g.setColour (scopeDim);
-        if (sx > waveArea.getX())
-            g.fillRect (juce::Rectangle<float> (waveArea.getX(), waveArea.getY(),
-                                                sx - waveArea.getX(), waveArea.getHeight()));
-        if (ex < waveArea.getRight())
-            g.fillRect (juce::Rectangle<float> (ex, waveArea.getY(),
-                                                waveArea.getRight() - ex, waveArea.getHeight()));
+        {
+            juce::Graphics::ScopedSaveState clip (g);
+            juce::Path screen;
+            screen.addRoundedRectangle (waveArea, 6.0f);
+            g.reduceClipRegion (screen);
+
+            g.setColour (scopeDim);
+            if (sx > waveArea.getX())
+                g.fillRect (juce::Rectangle<float> (waveArea.getX(), waveArea.getY(),
+                                                    sx - waveArea.getX(), waveArea.getHeight()));
+            if (ex < waveArea.getRight())
+                g.fillRect (juce::Rectangle<float> (ex, waveArea.getY(),
+                                                    waveArea.getRight() - ex, waveArea.getHeight()));
+        }
 
         // --- selection edges and handles -------------------------------------
         g.setColour (hot.withAlpha (0.95f));
@@ -1147,7 +1167,10 @@ void TapeDisplay::drawWave (juce::Graphics& g) const
         g.fillRect (juce::Rectangle<float> (ex - 2.0f, waveArea.getBottom() - 10.0f, 4.0f, 10.0f));
 
         // --- playhead --------------------------------------------------------
-        if (proc.getDisplayPlaying() || proc.getDisplayRecording())
+        // During a fresh take nothing is read back yet: the read head is parked
+        // at the start, so drawing it would claim the tape is playing.
+        if (! proc.getDisplayFreshRecording()
+            && (proc.getDisplayPlaying() || proc.getDisplayRecording()))
         {
             const float pos = proc.getDisplayLoopPosition();
             const float px = xAt (start + pos * (end - start));

@@ -283,6 +283,10 @@ private:
     juce::AudioBuffer<float> wetBuffer;
     juce::AudioBuffer<float> outBuffer;
 
+    // Scratch buffer size allocated in prepareToPlay(); processBlock must never
+    // resize a buffer on the audio thread.
+    int bufferCapacity = 0;
+
     juce::SmoothedValue<float> mixSmoothed, outputSmoothed;
 
     // Varispeed is applied as a playback rate; ramping it over a few blocks is

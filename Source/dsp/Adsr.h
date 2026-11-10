@@ -43,6 +43,16 @@ public:
 
         attackStep = 1.0f / (float) juce::jmax (1.0, attack * sampleRate);
         decayStep  = (1.0f - sustain) / (float) juce::jmax (1.0, decay * sampleRate);
+
+        // The release slope is derived from the level at note-off, so a new
+        // RELEASE value has to be re-applied to a release that is already
+        // running; otherwise the knob does nothing until the next note and the
+        // tail keeps the old length.  Only a real change of the parameter
+        // re-derives the step: setParams() is called every block, and recomputing
+        // unconditionally would turn the linear tail into an asymptote that never
+        // reaches zero.
+        if (stage == Stage::release && release != lastReleaseUsed)
+            restartRelease();
     }
 
     void noteOn() noexcept
@@ -55,7 +65,7 @@ public:
         if (stage == Stage::idle)
             return;
 
-        releaseStep = level / (float) juce::jmax (1.0, release * sampleRate);
+        restartRelease();
         stage = Stage::release;
     }
 
@@ -113,10 +123,22 @@ public:
 private:
     enum class Stage { idle = 0, attack = 1, decay = 2, sustain = 3, release = 4 };
 
+    // Recomputes the release slope from the current level.  Used by noteOff() and
+    // by setParams() when the RELEASE knob is turned mid-tail.
+    void restartRelease() noexcept
+    {
+        releaseStep = level / (float) juce::jmax (1.0, release * sampleRate);
+        lastReleaseUsed = release;
+    }
+
     double sampleRate = 48000.0;
 
     float attack = 0.020f, decay = 0.200f, sustain = 0.90f, release = 0.150f;
     float attackStep = 0.0f, decayStep = 0.0f, releaseStep = 0.0f;
+
+    // The release value the running tail was built from; a change of the knob
+    // re-derives the slope instead of being ignored until the next note.
+    float lastReleaseUsed = 0.150f;
 
     Stage stage = Stage::idle;
     float level = 0.0f;

@@ -55,6 +55,24 @@ public:
         dropoutRiseCoeff   = 1.0f - std::exp (-1.0f / (0.010f * (float) sampleRate));
         oxideSmoothCoeff   = 1.0f - std::exp (-1.0f / (0.020f * (float) sampleRate));
         envelopeCoeff      = std::exp (-1.0f / (0.250f * (float) sampleRate));
+        holdFadeStep       = dropoutRiseCoeff;   // 10 ms crossfade for S&H
+
+        // Lookup tables for the per-sample sin/tanh calls in the hot path.
+        // sinTable covers [0, 2π) (the LFO phases are wrapped every sample, so no
+        // reduction is needed on lookup); tanhTable covers [-4, 4] where tanh is
+        // already saturated to 5e-4 of full scale, so clamping the drive beyond
+        // it is inaudible.  Both are read with linear interpolation, which keeps
+        // the error far below 1 LSB at 24-bit.
+        sinTable.resize (1024);
+        tanhTable.resize (1024);
+        {
+            const double pi2 = 2.0 * juce::MathConstants<double>::pi;
+            for (int i = 0; i < 1024; ++i)
+                sinTable[(size_t) i] = (float) std::sin (i * pi2 / 1024.0);
+
+            for (int i = 0; i < 1024; ++i)
+                tanhTable[(size_t) i] = (float) std::tanh (-4.0 + 8.0 * (double) i / 1023.0);
+        }
 
         reset();
     }
@@ -78,6 +96,7 @@ public:
         dropoutRemaining = 0;
         dropoutCooldown = 0;
         holding = false;
+        holdMix = 0.0f;
         holdL = holdR = 0.0f;
 
         oxideMod = 0.0f;
@@ -162,10 +181,10 @@ public:
 
             if (useWow)
             {
-                const float modL = std::sin ((float) wowPhase) * wowDepthSec
-                                 + std::sin ((float) flutterPhase) * flutterDepthSec;
-                const float modR = std::sin ((float) wowPhase + 1.1f) * wowDepthSec
-                                 + std::sin ((float) flutterPhase + 0.7f) * flutterDepthSec;
+                const float modL = tableSin (sinTable, wowPhase) * wowDepthSec
+                                 + tableSin (sinTable, flutterPhase) * flutterDepthSec;
+                const float modR = tableSin (sinTable, wowPhase + 1.1) * wowDepthSec
+                                 + tableSin (sinTable, flutterPhase + 0.7) * flutterDepthSec;
 
                 const float dl = juce::jlimit (1.0f, (float) delaySize - 2.0f,
                                                (baseDelaySec + modL) * (float) sampleRate);
@@ -216,7 +235,12 @@ public:
                     holding = rng.nextFloat() < 0.35f;
                     holdL = xl;
                     holdR = xr;
-                    dropoutTarget = 0.0f;
+                    holdMix = 0.0f;
+
+                    // A sample-and-hold is a *freeze*, not a gap: the gain has to
+                    // stay at unity, otherwise the held sample is faded out within
+                    // ~2 ms and the effect is simply inaudible.
+                    dropoutTarget = holding ? 1.0f : 0.0f;
                 }
             }
 
@@ -226,14 +250,33 @@ public:
 
                 if (holding)
                 {
-                    xl = holdL;
-                    xr = holdR;
+                    // Crossfade into the frozen sample instead of hard-switching:
+                    // a step from the live signal to a held value is a click.
+                    holdMix = juce::jmin (1.0f, holdMix + holdFadeStep);
+                    xl += (holdL - xl) * holdMix;
+                    xr += (holdR - xr) * holdMix;
                 }
 
                 if (dropoutRemaining <= 0)
                 {
                     dropoutTarget = 1.0f;
                     dropoutCooldown = (int) (0.05 * sampleRate);
+                }
+            }
+            else if (holding)
+            {
+                // Fade back to the live signal after the freeze.
+                holdMix -= holdFadeStep;
+
+                if (holdMix <= 0.0f)
+                {
+                    holdMix = 0.0f;
+                    holding = false;
+                }
+                else
+                {
+                    xl += (holdL - xl) * holdMix;
+                    xr += (holdR - xr) * holdMix;
                 }
             }
 
@@ -248,8 +291,8 @@ public:
             {
                 const float drive = 1.0f + sat * 4.0f;
                 const float comp  = 1.0f / (1.0f + sat * 1.2f);
-                xl = std::tanh (xl * drive) * comp;
-                xr = std::tanh (xr * drive) * comp;
+                xl = tableTanh (tanhTable, xl * drive) * comp;
+                xr = tableTanh (tanhTable, xr * drive) * comp;
             }
 
             // ---- hiss --------------------------------------------------------
@@ -273,7 +316,7 @@ public:
 
             // ---- wear gain + slow "breathing" --------------------------------
             const float wearGain = 1.0f - wear * 0.25f;
-            const float breathe  = 1.0f + wear * 0.06f * std::sin ((float) breathePhase);
+            const float breathe  = 1.0f + wear * 0.06f * tableSin (sinTable, breathePhase);
             breathePhase += breatheInc;
             if (breathePhase >= 2.0 * juce::MathConstants<double>::pi)
                 breathePhase -= 2.0 * juce::MathConstants<double>::pi;
@@ -294,6 +337,11 @@ public:
 
     float getDropoutGain() const noexcept { return dropoutGain; }
 
+    // True while a sample-and-hold is crossfaded in.  The output gain stays at
+    // unity during a freeze, so the log has to watch this rather than the gain
+    // to see the event.
+    bool isHolding() const noexcept { return holding && holdMix > 0.5f; }
+
 private:
     float readDelay (const std::vector<float>& buf, float delaySamples) const noexcept
     {
@@ -306,6 +354,53 @@ private:
         const int i1 = (i0 + 1) % delaySize;
 
         return buf[(size_t) i0] + (buf[(size_t) i1] - buf[(size_t) i0]) * frac;
+    }
+
+    // Table lookup used per sample.  `phase` must be inside [0, 4π): the LFO
+    // phases are wrapped every sample and the callers only add a fixed channel
+    // offset (< 2π), so one conditional subtraction is enough and no modulo is
+    // needed here.
+    static float tableSin (const std::vector<float>& tab, double phase) noexcept
+    {
+        const double twoPi = 2.0 * juce::MathConstants<double>::pi;
+        double p = phase;
+        if (p >= twoPi)
+            p -= twoPi;
+        if (p < 0.0)
+            p = 0.0;
+
+        const double scale = (double) tab.size() / twoPi;
+        double idx = p * scale;
+
+        const int last = (int) tab.size() - 1;
+        if (idx > (double) last)
+            idx = (double) last;
+
+        const int i0 = (int) idx;
+        const float frac = (float) (idx - (double) i0);
+        const float a = tab[(size_t) i0];
+        const float b = tab[(size_t) (i0 >= last ? 0 : i0 + 1)];
+
+        return a + (b - a) * frac;
+    }
+
+    static float tableTanh (const std::vector<float>& tab, float x) noexcept
+    {
+        // Table spans [-4, 4], so the index is (x + 4) / 8 * (size - 1).
+        const double v = juce::jlimit (-4.0f, 4.0f, x);
+        const double idx = (v + 4.0) * 0.125 * (double) (tab.size() - 1);
+
+        const int last = (int) tab.size() - 1;
+        const int i0 = juce::jlimit (0, last, (int) idx);
+
+        if (i0 >= last)
+            return tab[(size_t) last];
+
+        const float frac = (float) (idx - (double) i0);
+        const float a = tab[(size_t) i0];
+        const float b = tab[(size_t) (i0 + 1)];
+
+        return a + (b - a) * frac;
     }
 
     double sampleRate = 48000.0;
@@ -326,9 +421,14 @@ private:
     int   dropoutCooldown = 0;
     bool  holding = false;
     float holdL = 0.0f, holdR = 0.0f;
+    float holdMix = 0.0f;
 
     float dropoutFallCoeff = 0.0f, dropoutRiseCoeff = 0.0f;
     float oxideSmoothCoeff = 0.0f, envelopeCoeff = 0.0f;
+    float holdFadeStep = 0.0f;
+
+    // LFO / saturation tables, built once in prepare().
+    std::vector<float> sinTable, tanhTable;
 
     float oxideMod = 0.0f, oxideTarget = 0.0f;
     int   oxideTimer = 0;

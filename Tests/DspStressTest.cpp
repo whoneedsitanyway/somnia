@@ -154,11 +154,44 @@ int main()
 
     const bool bounded = outMax <= 1.0 + 1.0e-3;
 
+    // --- RELEASE turned during the tail must re-derive the slope -------------
+    // The step was computed once at note-off, so moving the knob mid-tail did
+    // nothing until the next note.
+    bool releaseLiveOk = false;
+    {
+        somnia::Adsr a;
+        a.prepare (sr);
+        a.setParams (0.001f, 0.001f, 1.0f, 4.0f);   // 4 s tail
+
+        a.noteOn();
+        for (int i = 0; i < (int) sr; ++i)
+            a.process();
+
+        a.noteOff();
+
+        for (int i = 0; i < (int) (0.5 * sr); ++i)
+            a.process();
+
+        const float before = a.getLevel();
+        a.setParams (0.001f, 0.001f, 1.0f, 0.1f);   // shorten to 100 ms
+
+        for (int i = 0; i < (int) (0.2 * sr); ++i)
+            a.process();
+
+        releaseLiveOk = before > 0.05f && ! a.isActive() && a.getLevel() == 0.0f;
+
+        if (! releaseLiveOk)
+            std::cout << "release: before=" << before
+                      << " after=" << a.getLevel()
+                      << " stage=" << a.getStageIndex() << std::endl;
+    }
+
     std::cout << "outMax=" << outMax << " wetMax=" << wetMax
               << " nonFinite=" << nonFinite << " bounded=" << bounded
+              << " releaseLive=" << releaseLiveOk
               << " nanOk=" << nanOk << std::endl;
 
-    if (nonFinite || ! bounded || ! nanOk)
+    if (nonFinite || ! bounded || ! nanOk || ! releaseLiveOk)
     {
         std::cout << "FAIL: DSP stress" << std::endl;
         return 1;

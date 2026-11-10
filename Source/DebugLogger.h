@@ -74,12 +74,9 @@ public:
         return anomalyCount.load (std::memory_order_relaxed) > 0;
     }
 
-    void clearAnomaly() noexcept
-    {
-        anomalyCount.store (0, std::memory_order_relaxed);
-        lastFlags.store (0, std::memory_order_relaxed);
-    }
-
+    // Erases the log file.  Safe to call while the logger thread is running: the
+    // actual delete happens on that thread (see clearRequested), otherwise the
+    // message thread would race with an appendText() in flight.
     void clearLog();
 
     static juce::String describeFlags (unsigned flags);
@@ -87,6 +84,7 @@ public:
 private:
     void run() override;
     void drain();
+    void clearLogNow();
     void appendLine (const juce::String& line);
     static juce::String formatLine (const BlockSnapshot& s, bool anomaly);
     static juce::String timestamp();
@@ -111,8 +109,9 @@ private:
     int      suppressedSinceLastLog = 0;
 
     std::atomic<int>      anomalyCount { 0 };
-    std::atomic<unsigned> lastFlags { 0 };
-    std::atomic<double>   lastAnomalySec { 0.0 };
+
+    // Set by clearLog() from the message thread, consumed by the logger thread.
+    std::atomic<bool> clearRequested { false };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DebugLogger)
 };

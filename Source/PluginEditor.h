@@ -93,8 +93,6 @@ private:
 
     bool compact = false;
     bool darkTheme = true;
-    bool lastRecording = false;
-    bool lastPlaying = false;
 
     static constexpr int kWidth         = 1120;
     static constexpr int kFullHeight    = 740;

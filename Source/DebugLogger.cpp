@@ -45,11 +45,16 @@ void DebugLogger::push (const BlockSnapshot& s) noexcept
     int start1 = 0, size1 = 0, start2 = 0, size2 = 0;
     fifo.prepareToWrite (1, start1, size1, start2, size2);
 
+    // A single item can still be split when the free run starts at the very end
+    // of the ring, so both runs have to be honoured; writing only the first one
+    // silently dropped the block.
     if (size1 > 0)
-    {
         fifoData[(size_t) start1] = s;
-        fifo.finishedWrite (1);
-    }
+    else if (size2 > 0)
+        fifoData[(size_t) start2] = s;
+
+    if (size1 + size2 > 0)
+        fifo.finishedWrite (size1 + size2);
 }
 
 //==============================================================================
@@ -65,6 +70,20 @@ juce::File DebugLogger::getLogFile() const
 
 void DebugLogger::clearLog()
 {
+    // The logger thread owns the file and the bookkeeping below, so a request
+    // from the message thread is handed over instead of racing with an append
+    // that may be in flight.
+    if (isThreadRunning())
+    {
+        clearRequested.store (true, std::memory_order_relaxed);
+        return;
+    }
+
+    clearLogNow();
+}
+
+void DebugLogger::clearLogNow()
+{
     auto f = getLogFile();
     if (f.existsAsFile())
         f.deleteFile();
@@ -73,6 +92,8 @@ void DebugLogger::clearLog()
     lastLoggedSec = -1.0e9;
     lastLoggedFlags = 0;
     suppressedSinceLastLog = 0;
+    historyCount = 0;
+    historyWrite = 0;
 }
 
 //==============================================================================
@@ -88,6 +109,9 @@ void DebugLogger::run()
 
 void DebugLogger::drain()
 {
+    if (clearRequested.exchange (false, std::memory_order_relaxed))
+        clearLogNow();
+
     for (int guard = 0; guard < kFifoSize; ++guard)
     {
         int start1 = 0, size1 = 0, start2 = 0, size2 = 0;
@@ -106,8 +130,6 @@ void DebugLogger::drain()
 
         if (s.flags != 0)
         {
-            lastFlags.store (s.flags, std::memory_order_relaxed);
-            lastAnomalySec.store (s.timeSec, std::memory_order_relaxed);
             anomalyCount.fetch_add (1, std::memory_order_relaxed);
 
             const bool flagsChanged    = (s.flags != lastLoggedFlags);
@@ -223,7 +245,7 @@ juce::String DebugLogger::formatLine (const BlockSnapshot& s, bool anomaly)
          << " tone=" << juce::String (s.tone, 2)
          << " sat=" << juce::String (s.sat, 2)
          << " speed=" << juce::String (s.speed, 2)
-         << " out=" << juce::String (s.output, 1)
+         << " outGain=" << juce::String (s.output, 1)
          << " dir=" << s.direction
          << " len=" << s.loopChoice
          << " cyc=" << s.cycles
