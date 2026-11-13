@@ -39,7 +39,7 @@ int main()
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
     layout.add (std::make_unique<juce::AudioParameterFloat> ("mix", "Mix", 0.0f, 1.0f, 0.70f));
     layout.add (std::make_unique<juce::AudioParameterChoice> ("loopLength", "Loop Length",
-                 juce::StringArray { "Free", "1/1", "2/1", "4/1", "8/1", "16/1" }, 3));
+                 juce::StringArray { "Free", "1/1", "2/1", "4/1", "8/1", "16/1" }, 2));
     layout.add (std::make_unique<juce::AudioParameterFloat> ("wear", "Wear", 0.0f, 1.0f, 0.35f));
     layout.add (std::make_unique<juce::AudioParameterChoice> ("direction", "Direction",
                  juce::StringArray { "Forward", "Reverse", "Ping-Pong", "Random" }, 0));
@@ -69,6 +69,13 @@ int main()
     const bool saved = pm.savePreset ("Unit Test");
     const bool listed = pm.getPresetNames().contains ("Unit Test");
 
+    // The loop length belongs to the take, not to the preset: it must be absent
+    // from the file and survive loading whatever the current value is.
+    const auto unitTestFile = tmpDir.getChildFile (juce::String ("Unit Test")
+                                                   + PresetManager::extension);
+    const bool lengthAbsent = unitTestFile.existsAsFile()
+                           && ! unitTestFile.loadFileAsString().contains ("id=\"loopLength\"");
+
     setVal ("mix", 0.10f);
     setVal ("loopLength", 0.0f);
     setVal ("wear", 0.05f);
@@ -82,7 +89,7 @@ int main()
     const float dir = getVal ("direction");
 
     const bool valuesOk = std::abs (mix - 0.42f) < 0.001f
-                       && std::abs (len - 5.0f) < 0.01f
+                       && std::abs (len - 0.0f) < 0.01f
                        && std::abs (wear - 0.81f) < 0.001f
                        && std::abs (dir - 2.0f) < 0.01f;
 
@@ -111,6 +118,22 @@ int main()
     const bool transportOk = transportSaved && transportAbsent && transportLoaded
                           && std::abs (getVal ("transport") - 0.0f) < 0.01f;
 
+    // --- an older preset that still stores the loop length -------------------
+    // Loading such a file must keep the live value instead of resizing the tape
+    // and cutting off the material that is already recorded.
+    const auto oldLengthFile = tmpDir.getChildFile (juce::String ("Old Length")
+                                                    + PresetManager::extension);
+    oldLengthFile.replaceWithText ("<PARAMETERS presetName=\"Old Length\">\n"
+                                   "  <PARAM id=\"loopLength\" value=\"5\"/>\n"
+                                   "  <PARAM id=\"wear\" value=\"0.42\"/>\n"
+                                   "</PARAMETERS>\n");
+
+    setVal ("loopLength", 1.0f);
+    const bool oldLengthLoaded = pm.loadPreset ("Old Length");
+    const bool oldLengthOk = oldLengthLoaded
+                          && std::abs (getVal ("loopLength") - 1.0f) < 0.01f
+                          && std::abs (getVal ("wear") - 0.42f) < 0.001f;
+
     tmpDir.deleteRecursively();
 
     // --- factory presets -----------------------------------------------------
@@ -121,22 +144,30 @@ int main()
                         && somnia::factory::findXml ("Broken Reel") != nullptr;
 
     bool factoryXmlOk = true;
+    bool factoryLengthAbsent = true;
     for (const auto& p : factory)
     {
         auto xml = juce::XmlDocument::parse (p.xml);
         if (xml == nullptr || ! xml->hasTagName ("PARAMETERS")
             || xml->getNumChildElements() < 15)
             factoryXmlOk = false;
+
+        if (p.xml.contains ("id=\"loopLength\""))
+            factoryLengthAbsent = false;
     }
 
     std::cout << "saved=" << saved << " listed=" << listed << " loaded=" << loaded
               << " mix=" << mix << " len=" << len << " wear=" << wear << " dir=" << dir
+              << " lengthAbsent=" << lengthAbsent
               << " unicode=" << unicodeOk << " transport=" << transportOk
+              << " oldLength=" << oldLengthOk
               << " factory=" << factory.size() << " factoryOk=" << factoryOk
-              << " factoryXmlOk=" << factoryXmlOk << std::endl;
+              << " factoryXmlOk=" << factoryXmlOk
+              << " factoryLengthAbsent=" << factoryLengthAbsent << std::endl;
 
-    if (! (saved && listed && loaded && valuesOk && unicodeOk && transportOk
-           && factoryOk && factoryXmlOk))
+    if (! (saved && listed && loaded && valuesOk && lengthAbsent && unicodeOk
+           && transportOk && oldLengthOk && factoryOk && factoryXmlOk
+           && factoryLengthAbsent))
     {
         std::cout << "FAIL: preset round-trip" << std::endl;
         return 1;

@@ -89,7 +89,7 @@ APVTS::ParameterLayout SomniaAudioProcessor::createParameterLayout()
 
     // --- tape transport ------------------------------------------------------
     addChoice (ids::loopLength, "Loop Length",
-               { "Free", "1/1", "2/1", "4/1", "8/1", "16/1" }, 3);
+               { "Free", "1/1", "2/1", "4/1", "8/1", "16/1" }, 2);
     addFloat (ids::loopStart, "Loop Start", 0.0f, 1.0f, 0.0f);
     addFloat (ids::loopEnd, "Loop End", 0.0f, 1.0f, 1.0f);
     addFloat (ids::speed, "Speed", -24.0f, 24.0f, 0.0f, "st");

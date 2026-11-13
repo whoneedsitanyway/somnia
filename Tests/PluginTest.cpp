@@ -107,7 +107,7 @@ int main()
     };
 
     const bool defaultsOk = std::abs (get ("mix") - 0.70f) < 0.001f
-                         && std::abs (get ("loopLength") - 3.0f) < 0.01f
+                         && std::abs (get ("loopLength") - 2.0f) < 0.01f
                          && std::abs (get ("loopStart") - 0.0f) < 0.001f
                          && std::abs (get ("loopEnd") - 1.0f) < 0.001f
                          && std::abs (get ("transport") - 0.0f) < 0.01f

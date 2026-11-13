@@ -85,9 +85,11 @@ public:
 
         // The transport belongs to the session, not to a sound: it is left out of
         // the file so loading a preset can never start a recording or stop
-        // playback.
+        // playback.  The loop length is session state too: it belongs to the take
+        // the user recorded, and a preset changing it used to resize the tape and
+        // cut off existing material.
         auto state = apvts.copyState();
-        removeTransportFromState (state);
+        removeSessionParamsFromState (state);
 
         auto xml = state.createXml();
         if (xml == nullptr)
@@ -121,49 +123,59 @@ private:
         if (! tree.isValid())
             return false;
 
-        // Carry the live transport (and its host sync) into the incoming tree so
-        // loading an older preset that still stores them cannot move the tape.
-        copyTransportInto (tree, apvts.state);
+        // Carry the live session parameters (transport and its host sync, loop
+        // length) into the incoming tree so loading an older preset that still
+        // stores them cannot move or resize the tape.  copyState() flushes the
+        // live parameter values first, so a preset loaded right after a change
+        // still sees the current value rather than a stale one.
+        const auto liveState = apvts.copyState();
+        copySessionParamsInto (tree, liveState);
 
         apvts.replaceState (tree);
         return true;
     }
 
-    static bool isTransportId (const juce::ValueTree& child)
+    static bool isSessionId (const juce::ValueTree& child)
     {
         const auto id = child.getProperty ("id").toString();
-        return id == "transport" || id == "syncTransport";
+        return id == "transport" || id == "syncTransport" || id == "loopLength";
     }
 
-    static void removeTransportFromState (juce::ValueTree& tree)
+    static void removeSessionParamsFromState (juce::ValueTree& tree)
     {
         for (int i = tree.getNumChildren(); --i >= 0;)
-            if (isTransportId (tree.getChild (i)))
+            if (isSessionId (tree.getChild (i)))
                 tree.removeChild (i, nullptr);
     }
 
-    // Copies the transport-related parameters of `source` into `target`.
-    static void copyTransportInto (juce::ValueTree& target, const juce::ValueTree& source)
+    // Copies the session parameters of `source` into `target`, adding them when
+    // the incoming preset does not store them.
+    static void copySessionParamsInto (juce::ValueTree& target, const juce::ValueTree& source)
     {
-        for (int i = 0; i < target.getNumChildren(); ++i)
+        for (int j = 0; j < source.getNumChildren(); ++j)
         {
-            auto child = target.getChild (i);
+            const auto from = source.getChild (j);
 
-            if (! isTransportId (child))
+            if (! isSessionId (from))
                 continue;
 
-            const auto id = child.getProperty ("id").toString();
+            const auto id = from.getProperty ("id").toString();
+            bool copied = false;
 
-            for (int j = 0; j < source.getNumChildren(); ++j)
+            for (int i = 0; i < target.getNumChildren(); ++i)
             {
-                const auto from = source.getChild (j);
+                auto child = target.getChild (i);
 
-                if (from.getProperty ("id").toString() == id)
+                if (child.getProperty ("id").toString() == id)
                 {
                     child.setProperty ("value", from.getProperty ("value"), nullptr);
+                    copied = true;
                     break;
                 }
             }
+
+            if (! copied)
+                target.appendChild (from.createCopy(), nullptr);
         }
     }
 
