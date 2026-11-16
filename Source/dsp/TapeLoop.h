@@ -89,6 +89,11 @@ public:
         writePeak   = 0.0f;
         writtenEnd.store (0);
 
+        syncGlideGeometry();
+        lastRequestStart = -1.0;
+        lastRequestEnd   = -1.0;
+        jumpActive       = false;
+
         publishTapeLength();
     }
 
@@ -115,6 +120,7 @@ public:
         loopStart = 0.0;
         loopLength = tapeLength;
         wrapPositions();
+        syncGlideGeometry();
         publishTapeLength();
     }
 
@@ -137,6 +143,7 @@ public:
         tapeLength = juce::jmin (newLength, (double) maxSamples);
         clampLoopBounds();
         wrapPositions();
+        syncGlideGeometry();
         publishTapeLength();
 
         if (playing && std::abs (readPos - oldRead) > 0.05 * sampleRate)
@@ -148,6 +155,14 @@ public:
     void setLoopBoundsSeconds (double startSeconds, double endSeconds)
     {
         if (tapeLength <= 0.0 || ! tapeHasContent)
+            return;
+
+        // A free take that is still being written IS the whole tape, and it grows
+        // with the record head.  Applying a sub-window here clamped the record
+        // head into a window shorter than the take; write() then shrank the tape
+        // back to that head, so the take collapsed to a few milliseconds and the
+        // map froze.  The markers are applied as soon as the take is closed.
+        if (freeMode && freshRecording)
             return;
 
         const double tapeSec = tapeLength / sampleRate;
@@ -166,12 +181,39 @@ public:
             loopStart = 0.0;
             loopLength = tapeLength;
 
-            // While a free recording grows, the write head sits exactly at the
-            // tape end; wrapping it would rewind the take to the start.
-            keepHeadsInWindow (oldStart, oldLength, ! (freeMode && freshRecording));
+            // Only touch the heads when the window really moved.  A take whose
+            // length is a whole number of blocks leaves the head exactly on the
+            // loop end at a block boundary; wrapping it here swallowed the pass
+            // (read() never saw the crossing, so the pass counter and the wrap
+            // flag stayed behind).  keepHeadsInWindow() also clamped the record
+            // head one sample back per block, which quietly shortened the take.
+            const bool moved = std::abs (loopStart - oldStart) > 0.5
+                            || std::abs (loopLength - oldLength) > 0.5;
+
+            if (moved)
+            {
+                // While a free recording grows, the write head sits exactly at the
+                // tape end; wrapping it would rewind the take to the start.
+                keepHeadsInWindow (oldStart, oldLength, ! (freeMode && freshRecording));
+                syncGlideGeometry();
+            }
+
+            lastRequestStart = s;
+            lastRequestEnd   = e;
             publishTapeLength();
             return;
         }
+
+        // The processor re-applies the bounds on every block.  Comparing the raw
+        // request before the zero-crossing search keeps that at two compares in
+        // the steady state instead of scanning the material for both edges on
+        // the audio thread every block.
+        if (std::abs (s - lastRequestStart) < 0.5
+            && std::abs (e - lastRequestEnd) < 0.5)
+            return;
+
+        lastRequestStart = s;
+        lastRequestEnd   = e;
 
         // Both edges are nudged onto the nearest zero crossing of the material.
         // The join between the loop end and its start is a physical splice: if
@@ -206,12 +248,17 @@ public:
             return;
 
         const double oldStart  = loopStart;
-        const double oldLength = loopLength;
 
         loopStart = s;
         loopLength = e - s;
 
-        keepHeadsInWindow (oldStart, oldLength, true);
+        // The record head jumps to the new window at once: it has to keep
+        // pointing at the same material when the window moves.  The read head is
+        // deliberately not moved here — read() slides the audible window instead,
+        // see startWindowGlide().
+        relocateWriteHead (loopStart - oldStart, loopLength);
+        startWindowGlide();
+
         publishTapeLength();
     }
 
@@ -249,6 +296,11 @@ public:
         // the jump from silence to whatever the take begins with is a click.
         playing = true;
         fadeGain = 0.0f;
+        jumpActive = false;
+
+        // Nothing is audible yet, so a window change that arrived while the tape
+        // was stopped is applied at once instead of gliding on the first block.
+        syncGlideGeometry();
     }
 
     void stopPlayback() noexcept
@@ -301,6 +353,16 @@ public:
         {
             freshRecording = false;
         }
+
+        // A fresh take starts a new window from scratch; nothing is playing back
+        // yet, so there is nothing to glide.
+        if (freshRecording)
+        {
+            syncGlideGeometry();
+            lastRequestStart = -1.0;
+            lastRequestEnd   = -1.0;
+            jumpActive       = false;
+        }
     }
 
     void stopRecording()
@@ -336,6 +398,9 @@ public:
         if (freshRecording && tapeHasContent
             && loopLength >= (double) minLoopSamples())
             fadeOutTakeTail ((int) (loopStart + loopLength) - 1);
+
+        // The take just became a loop: the window is final, nothing is gliding.
+        syncGlideGeometry();
 
         // writtenEnd is an absolute buffer index: everything at or beyond it has
         // never been recorded since the last erase.  copyWaveform clamps it to
@@ -376,6 +441,11 @@ public:
         writePeak = 0.0f;
         writtenEnd.store (0);
 
+        syncGlideGeometry();
+        lastRequestStart = -1.0;
+        lastRequestEnd   = -1.0;
+        jumpActive       = false;
+
         publishTapeLength();
         writeVersion.fetch_add (1, std::memory_order_relaxed);
     }
@@ -386,9 +456,9 @@ public:
         if (loopLength <= 0.0)
             return;
 
+        beginHeadJump();
         readPos -= seconds * sampleRate;
         wrapReadPosition();
-        fadeGain = 0.0f;
     }
 
     void fastForward (double seconds)
@@ -396,9 +466,9 @@ public:
         if (loopLength <= 0.0)
             return;
 
+        beginHeadJump();
         readPos += seconds * sampleRate;
         wrapReadPosition();
-        fadeGain = 0.0f;
     }
 
     //==========================================================================
@@ -520,20 +590,46 @@ public:
             return;
         }
 
-        const double len   = loopLength;
-        const double start = loopStart;
-        const int    base  = (int) loopStart;
-        const int    n     = (int) loopLength;
-        const int    written = writtenEnd.load (std::memory_order_relaxed);
+        // The audible window glides toward loopStart/loopLength (see
+        // startWindowGlide()).  When no glide is in flight the two are identical,
+        // so this is a single compare per block.
+        if (glideRemaining <= 0)
+            syncGlideGeometry();
+
+        double start = glideStart;
+        double len   = glideLen;
+        int    base  = (int) glideStart;
+
+        // The interpolation window is rounded *up*: a gliding window has a
+        // fractional length, and truncating it made the last sample of the pass
+        // wrap to the loop start instead of reading the material at the end.
+        int    n     = (int) std::ceil (glideLen);
+        const int written = writtenEnd.load (std::memory_order_relaxed);
         const double speed = std::isfinite ((double) p.speed)
                                  ? juce::jlimit (0.25, 4.0, (double) p.speed) : 1.0;
         const int requestedDirection = juce::jlimit (0, 3, p.direction);
 
+        // Per-sample increments of the window glide.  Recomputed every block, so
+        // a new drag position retargets the slide from wherever it currently is.
+        bool   gliding = glideRemaining > 0;
+        double dStart  = 0.0;
+        double dLen    = 0.0;
+
+        if (gliding)
+        {
+            const double inv = 1.0 / (double) glideRemaining;
+            dStart = (loopStart - glideStart) * inv;
+            dLen   = (loopLength - glideLen) * inv;
+        }
+
         if (requestedDirection != lastDirection)
         {
             lastDirection = requestedDirection;
+
+            // A direction change relocates the head; crossfade it instead of
+            // dropping the level to zero (see beginHeadJump()).
+            beginHeadJump();
             dir = requestedDirection == reverse ? -1 : 1;
-            fadeGain = 0.0f;
         }
 
         const float spliceAmount = juce::jlimit (0.0f, 1.0f, p.splice);
@@ -573,22 +669,11 @@ public:
             else if (requestedDirection == reverse)
                 dir = -1;
 
-            // Material that has never been written since the last erase reads as
-            // silence.  This is what makes clear() real-time safe: the buffer is
-            // not zeroed, it is simply declared empty.
-            float l = 0.0f, r = 0.0f;
-
-            if (start + readPos + 2.0 < (double) written)
-                readCubicPair (bufferL.data(), bufferR.data(), base, n, readPos, l, r);
-
-            outL[i] = l * fadeGain;
-            outR[i] = r * fadeGain;
-
-            if (fadeGain < 1.0f)
-                fadeGain = juce::jmin (1.0f, fadeGain + fadeStep);
-
-            readPos += speed * (double) dir;
-
+            // The head is wrapped or reflected *before* the sample is read, so the
+            // interpolation never starts outside the window.  Reading first left
+            // the last sample of every pass interpolated from the loop start
+            // instead of the material at the end, which put a step right before
+            // the join.
             if (requestedDirection == pingPong)
             {
                 // Reflect at the tape ends instead of wrapping.  Wrapping and
@@ -622,19 +707,91 @@ public:
             }
             else if (readPos >= len)
             {
-                readPos -= len;
-
                 // The join between the end and the start of a tape loop is a
-                // physical splice, and the two samples either side of it are
-                // unrelated: without a short fade every pass started with a click.
-                fadeGain = 0.0f;
+                // physical splice: the two samples either side of it are unrelated.
+                // A fade-in from silence only moved the click (the step down to
+                // zero is itself a jump), so the join is crossfaded: the material
+                // just past the end keeps playing for a few milliseconds while the
+                // loop start fades in.
+                beginHeadJump();
+                readPos -= len;
                 onWrap (requestedDirection, rng);
             }
             else if (readPos < 0.0)
             {
+                beginHeadJump();
                 readPos += len;
-                fadeGain = 0.0f;
                 onWrap (requestedDirection, rng);
+            }
+
+            // Material that has never been written since the last erase reads as
+            // silence.  This is what makes clear() real-time safe: the buffer is
+            // not zeroed, it is simply declared empty.
+            float l = 0.0f, r = 0.0f;
+
+            if (start + readPos + 2.0 < (double) written)
+                readCubicPair (bufferL.data(), bufferR.data(), base, n, written,
+                               start + readPos, l, r);
+
+            // Crossfade after a relocation: the stream at the old position keeps
+            // playing while the new one fades in.  A fade-in from silence would
+            // itself be a step — the sample before the jump is not zero.
+            if (jumpActive)
+            {
+                float ol = 0.0f, orr = 0.0f;
+
+                // Read the old head at its absolute material position, not wrapped
+                // into the old window: after a marker move it can sit outside it,
+                // and wrapping there would put a jump into the fading-out stream.
+                if (jumpPos >= 0.0 && jumpPos + 2.0 < (double) written)
+                    readCubicPair (bufferL.data(), bufferR.data(), 0, written, written,
+                                   jumpPos, ol, orr);
+
+                const float t = 1.0f - (float) jumpRemaining / (float) jumpTotal;
+                const float w = 0.5f - 0.5f * std::cos (juce::MathConstants<float>::pi * t);
+
+                l = ol + (l - ol) * w;
+                r = orr + (r - orr) * w;
+
+                jumpPos += speed * (double) jumpDir;
+
+                // The old head must keep running on the absolute tape: it is the
+                // material *past* the loop end that makes the join continuous.
+                // Wrapping it into the old window put the jump back into the
+                // fading-out stream.
+                if (--jumpRemaining <= 0)
+                    jumpActive = false;
+            }
+
+            outL[i] = l * fadeGain;
+            outR[i] = r * fadeGain;
+
+            if (fadeGain < 1.0f)
+                fadeGain = juce::jmin (1.0f, fadeGain + fadeStep);
+
+            readPos += speed * (double) dir;
+
+            // Slide the audible window one sample further toward its target and
+            // carry the head with it: readPos is relative to the window start, so
+            // subtracting the shift keeps the head on the same material.  Without
+            // this the window stepped once per drag event, which moved the head to
+            // another sample and restarted the fade — heard as crackle.
+            if (gliding)
+            {
+                glideStart += dStart;
+                glideLen   += dLen;
+                readPos    -= dStart;
+
+                if (--glideRemaining <= 0)
+                {
+                    syncGlideGeometry();
+                    gliding = false;
+                }
+
+                start = glideStart;
+                len   = glideLen;
+                base  = (int) glideStart;
+                n     = (int) std::ceil (glideLen);
             }
 
             // Splices: jump to another phrase boundary.  The jump happens only
@@ -697,8 +854,16 @@ public:
             return;
 
         const float fb = juce::jlimit (0.0f, 0.95f, p.feedback);
-        const int windowLen = (int) loopLength;   // window is whole samples
-        const int base = (int) loopStart;
+
+        // A fresh take always records from the top of the tape and runs to its
+        // end: the loop window is a *playback* range.  Letting the window clamp
+        // the record head made the take shorter than the tape, and in free mode
+        // it fed back into the tape length (the free branch sets tapeLength from
+        // writeIndex), so a take recorded with a dragged marker collapsed to a
+        // few milliseconds and the map froze.
+        const int windowLen = freshRecording ? juce::jmax (1, (int) tapeLength)
+                                            : juce::jmax (1, (int) loopLength);
+        const int base      = freshRecording ? 0 : (int) loopStart;
         int written = writtenEnd.load (std::memory_order_relaxed);
 
         for (int i = 0; i < numSamples; ++i)
@@ -805,6 +970,7 @@ private:
         const int n = juce::jmin (juce::jmax (1, (int) (0.004 * sampleRate)),
                                   lastIndex + 1);
 
+
         for (int i = 0; i < n; ++i)
         {
             const float gain = (float) i / (float) n;
@@ -867,8 +1033,11 @@ private:
     // written by the audio thread while a free recording grows.
     void publishTapeLength() noexcept
     {
-        const int end = (int) (loopStart + loopLength);
-        tapeLengthForUI.store (juce::jlimit (0, maxSamples, end),
+        // The map shows the *tape*, not the loop window: with a dragged marker
+        // the window ends before the material does, and publishing the window end
+        // cut the recorded tail off the map (the take looked like it stopped
+        // where the marker sat).
+        tapeLengthForUI.store (juce::jlimit (0, maxSamples, (int) tapeLength),
                                std::memory_order_relaxed);
     }
 
@@ -916,19 +1085,70 @@ private:
         // The same compensation for the record head, then a wrap into the new
         // window (shrinking the loop must not leave the head outside it).
         if (relocateWrite)
-        {
-            double wp = std::fmod ((double) writeIndex - shift, loopLength);
-            if (wp < 0.0)
-                wp += loopLength;
-            writeIndex = (int) wp;
-        }
+            relocateWriteHead (shift, loopLength);
         else
-        {
             writeIndex = juce::jlimit (0, juce::jmax (0, (int) loopLength - 1), writeIndex);
-        }
 
         if (jumped || std::abs (loopLength - oldLength) > 0.05 * sampleRate)
             fadeGain = 0.0f;
+    }
+
+    // Keeps the record head pointing at the same material after the window moved
+    // by `shift` samples, wrapped into a window of `windowLen` samples.
+    void relocateWriteHead (double shift, double windowLen) noexcept
+    {
+        if (windowLen <= 0.0)
+        {
+            writeIndex = 0;
+            return;
+        }
+
+        double wp = std::fmod ((double) writeIndex - shift, windowLen);
+        if (wp < 0.0)
+            wp += windowLen;
+
+        writeIndex = juce::jlimit (0, juce::jmax (0, (int) windowLen - 1), (int) wp);
+    }
+
+    // The audible window (glideStart/glideLen) follows loopStart/loopLength over
+    // ~12 ms instead of stepping to them.  A drag delivers a new marker position
+    // every ~16 ms; applied as a step, each update moved the read head to another
+    // sample and restarted the 4 ms fade, which is heard as crackle.  Sliding the
+    // window (and carrying the head with it, see read()) turns the same move into
+    // a short scrub.
+    void startWindowGlide() noexcept
+    {
+        glideRemaining = juce::jmax (1, (int) (0.012 * sampleRate));
+    }
+
+    void syncGlideGeometry() noexcept
+    {
+        glideStart = loopStart;
+        glideLen   = loopLength;
+        glideRemaining = 0;
+    }
+
+    // Starts a short crossfade of the read head.  Called *before* the head is
+    // moved: the old stream keeps playing from its current material position
+    // while the new one fades in over ~10 ms.  Relocations (a loop marker moved
+    // past the head, a direction change, REW/FF) used to drop the level to zero
+    // instead, and that step from the last sample to silence is itself a click.
+    void beginHeadJump() noexcept
+    {
+        if (glideLen < (double) minLoopSamples())
+            return;
+
+        jumpPos   = glideStart + readPos;
+        jumpStart = glideStart;
+        jumpLen   = glideLen;
+        jumpDir   = dir;
+
+        jumpTotal = jumpRemaining = juce::jmax (1, (int) (0.010 * sampleRate));
+        jumpActive = true;
+
+        // The crossfade provides the smoothing, so the fade-in from silence must
+        // not also attenuate the new stream.
+        fadeGain = 1.0f;
     }
 
     void wrapReadPosition() noexcept
@@ -992,7 +1212,7 @@ private:
     // Catmull-Rom interpolation of both channels.  The window is
     // [base, base+n) with whole-sample bounds.
     static void readCubicPair (const float* bufL, const float* bufR,
-                               int base, int n, double pos,
+                               int base, int n, int validEnd, double pos,
                                float& outL, float& outR) noexcept
     {
         if (n <= 0)
@@ -1000,6 +1220,19 @@ private:
             outL = outR = 0.0f;
             return;
         }
+
+        // A tap just outside the window is real tape material: the head reads
+        // across the loop seam for the last two samples of every pass, and the
+        // join is crossfaded right after.  Wrapping those taps into the window
+        // mixed the loop start into the last sample of the pass, which put a
+        // step of up to full amplitude *before* the crossfade could hide it.
+        auto tap = [base, n, validEnd] (int i) noexcept
+        {
+            if (i >= 0 && i < validEnd && (i < base || i >= base + n))
+                return i;
+
+            return wrapIndex (i, base, n);
+        };
 
         const int i1 = (int) std::floor (pos);
         const float frac = (float) (pos - (double) i1);
@@ -1024,10 +1257,10 @@ private:
             return;
         }
 
-        const int im1 = wrapIndex (i1 - 1, base, n);
-        const int i0  = wrapIndex (i1,     base, n);
-        const int ip1 = wrapIndex (i1 + 1, base, n);
-        const int ip2 = wrapIndex (i1 + 2, base, n);
+        const int im1 = tap (i1 - 1);
+        const int i0  = tap (i1);
+        const int ip1 = tap (i1 + 1);
+        const int ip2 = tap (i1 + 2);
 
         const float yl0 = bufL[(size_t) im1], yl1 = bufL[(size_t) i0];
         const float yl2 = bufL[(size_t) ip1], yl3 = bufL[(size_t) ip2];
@@ -1069,6 +1302,26 @@ private:
     double loopStart    = 0.0;   // offset of the loop window inside the tape
     double loopLength   = 0.0;   // length of the loop window
     double targetLength = 0.0;
+
+    // Audible window, glided toward loopStart/loopLength by read() (see
+    // startWindowGlide()).  Equal to them whenever no glide is in flight.
+    double glideStart      = 0.0;
+    double glideLen        = 0.0;
+    int    glideRemaining  = 0;
+
+    // Last raw bounds request in samples, so a per-block re-apply does not have
+    // to scan the material for zero crossings again.
+    double lastRequestStart = -1.0;
+    double lastRequestEnd   = -1.0;
+
+    // Crossfade of the read head after a relocation; see beginHeadJump().
+    bool   jumpActive    = false;
+    int    jumpRemaining = 0;
+    int    jumpTotal     = 0;
+    double jumpPos       = 0.0;   // absolute material position of the old head
+    double jumpStart     = 0.0;
+    double jumpLen       = 0.0;
+    int    jumpDir       = 1;
 
     // Whole-sample window geometry makes the read wrap and the buffer addressing
     // exact; readPos is relative to loopStart, writeIndex is the record head

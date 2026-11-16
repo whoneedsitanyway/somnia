@@ -826,6 +826,48 @@ int main()
         }
     }
 
+    // --- the tape map must follow a free take made with dragged markers ------
+    // A free take that is still being written is the whole tape: the loop window
+    // is a playback range.  Letting it clamp the record head shrank the tape to
+    // the window end, so the take stopped at a few milliseconds and the map
+    // looked frozen.
+    bool mapGrowsOk = true;
+    {
+        if (auto* p = proc.apvts.getParameter ("loopLength"))
+            p->setValueNotifyingHost (p->convertTo0to1 (0.0f));   // Free
+        if (auto* p = proc.apvts.getParameter ("loopStart"))
+            p->setValueNotifyingHost (p->convertTo0to1 (0.0f));
+        if (auto* p = proc.apvts.getParameter ("loopEnd"))
+            p->setValueNotifyingHost (p->convertTo0to1 (0.98f));
+
+        proc.clearLoop();
+        double mapPeak = 0.0;
+        renderSeconds (proc, 0.05, mapPeak);
+
+        proc.setTransport (2);
+        const bool mapFinite = renderSeconds (proc, 1.5, mapPeak);
+        proc.setTransport (0);
+        renderSeconds (proc, 0.05, mapPeak);
+
+        std::vector<float> mn ((size_t) 256, 0.0f), mx ((size_t) 256, 0.0f);
+        proc.copyLoopWaveform (mn.data(), mx.data(), 256);
+
+        float energy = 0.0f;
+        for (int i = 0; i < 256; ++i)
+            energy = juce::jmax (energy, mx[(size_t) i] - mn[(size_t) i]);
+
+        const float tape = proc.getDisplayTapeLengthSeconds();
+        mapGrowsOk = mapFinite && tape > 1.2f && energy > 0.01f
+                  && proc.getDisplayHasContent();
+
+        if (! mapGrowsOk)
+            std::cout << "map growth: tape=" << tape << " energy=" << energy
+                      << " content=" << proc.getDisplayHasContent() << std::endl;
+
+        if (auto* p = proc.apvts.getParameter ("loopEnd"))
+            p->setValueNotifyingHost (p->convertTo0to1 (1.0f));
+    }
+
     std::cout << "defaults=" << defaultsOk
               << " freeLen=" << freeLen << " free=" << freeOk
               << " recLevel=" << recLevelOk
@@ -836,6 +878,7 @@ int main()
               << " syncTransport=" << syncTransportOk
               << " syncLen=" << syncLen << " sync=" << syncOk
               << " waveform=" << waveformOk
+              << " mapGrows=" << mapGrowsOk
               << " fullPass=" << fullPassOk
               << " random=" << randomOk << " state=" << stateOk
               << " editor=" << editorOk
@@ -845,7 +888,7 @@ int main()
 
     if (! (defaultsOk && freeOk && recLevelOk && overdubLevelOk && playOk
            && finite && pingPongOk && releaseOk && syncTransportOk && syncOk
-           && waveformOk && fullPassOk && randomOk && stateOk && editorOk
+           && waveformOk && mapGrowsOk && fullPassOk && randomOk && stateOk && editorOk
            && musicalOk && contrastOk && mixZeroOk))
     {
         std::cout << "FAIL: plugin integration" << std::endl;

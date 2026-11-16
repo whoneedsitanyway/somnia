@@ -768,6 +768,134 @@ int main()
                       << " edge=" << edge << std::endl;
     }
 
+    // --- a fast marker drag must not crackle --------------------------------
+    // A drag delivers a new position every ~16 ms.  Applied as a step, each
+    // update moved the read head to another sample and restarted the 4 ms fade,
+    // which is heard as crackle.  The window now glides, so the output has no
+    // sample-to-sample jumps.
+    bool fastDragOk = true;
+    {
+        somnia::TapeLoop t;
+        t.prepare (sr, 4.0);
+        t.setFreeMode (true);
+        t.startRecording (false);
+
+        double ph = 0.0;
+        for (int b = 0; b < recordBlocks; ++b)
+        {
+            for (int i = 0; i < block; ++i)
+            {
+                const float s = (float) (0.5 * std::sin (ph + 2.0 * juce::MathConstants<double>::pi
+                                                              * 440.0 * (double) i / sr));
+                inL[(size_t) i] = s;
+                inR[(size_t) i] = s;
+            }
+            ph += 2.0 * juce::MathConstants<double>::pi * 440.0 * block / sr;
+            t.write (inL.data(), inR.data(), nullptr, nullptr, block, p);
+        }
+        t.stopRecording();
+        t.startPlayback();
+
+        somnia::TapeLoop::Params q;
+        q.direction = somnia::TapeLoop::forward;
+        q.speed = 1.0f;
+
+        const int dragBlock = (int) (0.016 * sr);   // one drag event per 16 ms
+
+        int   worstIdx  = -1;
+
+        auto measureJump = [&] (float& worst)
+        {
+            t.read (outL.data(), outR.data(), dragBlock, q, rng);
+
+            float prev = outL[0];
+
+            for (int i = 0; i < dragBlock; ++i)
+            {
+                const float d = std::abs (outL[(size_t) i] - prev);
+                if (d > worst)
+                {
+                    worst    = d;
+                    worstIdx = i;
+                }
+                prev = outL[(size_t) i];
+            }
+        };
+
+        float worstJump = 0.0f;
+
+
+        // Drag START to the right in 25 ms steps, then back to the left.
+        for (int step = 1; step <= 40; ++step)
+        {
+            const double s = 0.001 * (double) step;
+            t.setLoopBoundsSeconds (s, 0.90);
+            measureJump (worstJump);
+        }
+
+        for (int step = 39; step >= 0; --step)
+        {
+            const double s = 0.001 * (double) step;
+            t.setLoopBoundsSeconds (s, 0.90);
+            measureJump (worstJump);
+        }
+
+        // Drag END in the same way.
+        for (int step = 1; step <= 40; ++step)
+        {
+            const double e = 0.90 - 0.001 * (double) step;
+            t.setLoopBoundsSeconds (0.02, e);
+            measureJump (worstJump);
+        }
+
+        // A 440 Hz sine at 0.5 amplitude moves ~0.03 per sample; a click from a
+        // 0.5 jump would be far above the 0.08 bar.
+        fastDragOk = worstJump < 0.08f;
+
+        if (! fastDragOk)
+            std::cout << "fast drag: worstJump=" << worstJump
+                      << " idx=" << worstIdx << std::endl;
+    }
+
+    // --- a free take grows past a dragged loop marker ------------------------
+    // The loop window is a playback range.  It used to clamp the record head,
+    // and in free mode the tape length is derived from that head: a take made
+    // with a dragged marker collapsed to a few milliseconds and the tape map
+    // froze there instead of following the take.
+    bool growThroughBoundsOk = true;
+    {
+        somnia::TapeLoop t3;
+        t3.prepare (sr, 4.0);
+        t3.setFreeMode (true);
+        t3.startRecording (false);
+
+        double ph3 = 0.0;
+
+        for (int b = 0; b < 200; ++b)   // ~2.1 s
+        {
+            // The processor re-applies the markers on every block, exactly like
+            // a drag that left the END short of the tape end.
+            t3.setLoopBoundsSeconds (0.0, 0.98 * t3.getTapeLengthSeconds());
+
+            for (int i = 0; i < block; ++i)
+            {
+                const float s = (float) (0.5 * std::sin (ph3 + 2.0 * juce::MathConstants<double>::pi
+                                                               * 440.0 * (double) i / sr));
+                inL[(size_t) i] = s;
+                inR[(size_t) i] = s;
+            }
+            ph3 += 2.0 * juce::MathConstants<double>::pi * 440.0 * block / sr;
+
+            t3.write (inL.data(), inR.data(), nullptr, nullptr, block, p);
+        }
+
+        const double grown = t3.getTapeLengthSeconds();
+        growThroughBoundsOk = grown > 2.0 && t3.hasContent();
+
+        if (! growThroughBoundsOk)
+            std::cout << "free take with dragged marker: tape=" << grown << std::endl;
+    }
+
     std::cout << "clearRT=" << clearSilentOk << " windowWrite=" << windowWriteOk
               << " revFresh=" << reverseFreshOk << " tapeFull=" << tapeFullOk
               << std::endl;
@@ -781,6 +909,8 @@ int main()
               << " longPing=" << longPingOk
               << " drag=" << dragOk
               << " clickFree=" << clickFreeOk << " snap=" << snapOk
+              << " fastDrag=" << fastDragOk
+              << " growBounds=" << growThroughBoundsOk
               << " sync=" << syncOk << " bounds=" << boundsOk
               << " silent=" << silent << " nan=" << nanOk
               << " tail=" << tailAudible << "/" << tailSilent
@@ -791,7 +921,7 @@ int main()
            && syncOk && boundsOk && silent && nanOk && tailAudible && tailSilent
            && clearOk
            && clearSilentOk && windowWriteOk && reverseFreshOk && tapeFullOk
-           && clickFreeOk && snapOk))
+           && clickFreeOk && snapOk && fastDragOk && growThroughBoundsOk))
     {
         std::cout << "FAIL: tape loop" << std::endl;
         return 1;
