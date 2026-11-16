@@ -54,6 +54,25 @@ private:
     float minNorm() const;
     void  setBound (int which, float value);
 
+    // Loop window the map should draw.  While a drag is in flight the pointer
+    // position is used directly, without waiting for the value to travel to the
+    // host and back; that round-trip is what made the markers lag behind the
+    // mouse.
+    void displayBounds (float& start, float& end) const;
+    void previewDragBounds (float start, float end,
+                            float& newStart, float& newEnd) const;
+
+    // Only the map and the footer follow a drag; repainting the header and the
+    // reels at mouse rate was a large part of the sluggish feel.
+    juce::Rectangle<int> dragRepaintArea() const;
+
+    void beginGesture (const char* id);
+    void endGestures();
+
+    // Parameter gestures of the markers being dragged.  Reported to the host as
+    // one automation gesture instead of a separate write per drag step.
+    std::vector<juce::RangedAudioParameter*> gestureParams;
+
     SomniaAudioProcessor& proc;
 
     // Filled from the audio thread's tape buffer during paint(), hence mutable.

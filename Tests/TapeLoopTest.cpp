@@ -651,6 +651,123 @@ int main()
                       << " restarted=" << restarted << std::endl;
     }
 
+    // --- the loop join must not click ---------------------------------------
+    // A take that opens and closes mid-waveform made every pass jump from the
+    // last sample straight to the first one.  The take now opens on a true zero
+    // and its tail is tapered, so both edges of the loop meet in silence.
+    bool clickFreeOk = true;
+    {
+        somnia::TapeLoop t;
+        t.prepare (sr, 4.0);
+        t.setFreeMode (true);
+        t.startRecording (false);
+
+        // Starts at the sine peak, i.e. nowhere near zero.
+        double ph = juce::MathConstants<double>::halfPi;
+        for (int b = 0; b < recordBlocks; ++b)
+        {
+            for (int i = 0; i < block; ++i)
+            {
+                const float s = (float) (0.5 * std::sin (ph + 2.0 * juce::MathConstants<double>::pi
+                                                              * 440.0 * (double) i / sr));
+                inL[(size_t) i] = s;
+                inR[(size_t) i] = s;
+            }
+            ph += 2.0 * juce::MathConstants<double>::pi * 440.0 * block / sr;
+            t.write (inL.data(), inR.data(), nullptr, nullptr, block, p);
+        }
+        t.stopRecording();
+
+        const int total = t.getWrittenEnd();
+        t.startPlayback();
+
+        somnia::TapeLoop::Params q;
+        q.direction = somnia::TapeLoop::forward;
+        q.speed = 1.0f;
+
+        // One full pass plus the first samples of the next one.
+        std::vector<float> pass ((size_t) total + block, 0.0f);
+        int filled = 0;
+
+        while (filled < (int) pass.size())
+        {
+            t.read (outL.data(), outR.data(), block, q, rng);
+            for (int i = 0; i < block && filled < (int) pass.size(); ++i)
+                pass[(size_t) filled++] = outL[(size_t) i];
+        }
+
+        const float beforeJoin = std::abs (pass[(size_t) total - 1]);
+        const float afterJoin  = std::abs (pass[(size_t) total]);
+
+        // A 440 Hz sine at 0.5 amplitude moves ~0.03 per sample, so anything
+        // below 0.06 can only be the taper (before) and the fade (after).
+        clickFreeOk = beforeJoin < 0.06f && afterJoin < 0.06f;
+
+        if (! clickFreeOk)
+            std::cout << "loop join: before=" << beforeJoin
+                      << " after=" << afterJoin << std::endl;
+    }
+
+    // --- loop edges snap onto zero crossings --------------------------------
+    // A window cut at an arbitrary sample starts and ends mid-waveform, which is
+    // a step at the splice.  The edges are nudged onto the nearest zero crossing
+    // of the material, so any window has a soft in and a soft out.
+    bool snapOk = true;
+    {
+        somnia::TapeLoop t;
+        t.prepare (sr, 4.0);
+        t.setFreeMode (true);
+        t.startRecording (false);
+
+        double ph = 0.0;
+        for (int b = 0; b < recordBlocks; ++b)
+        {
+            for (int i = 0; i < block; ++i)
+            {
+                const float s = (float) (0.5 * std::sin (ph + 2.0 * juce::MathConstants<double>::pi
+                                                              * 440.0 * (double) i / sr));
+                inL[(size_t) i] = s;
+                inR[(size_t) i] = s;
+            }
+            ph += 2.0 * juce::MathConstants<double>::pi * 440.0 * block / sr;
+            t.write (inL.data(), inR.data(), nullptr, nullptr, block, p);
+        }
+        t.stopRecording();
+
+        // 10936 sits on a peak of the 440 Hz sine: without snapping the window
+        // would end at full amplitude.
+        const int requestedEnd = 10936;
+        t.setLoopBoundsSeconds (0.10, (double) requestedEnd / sr);
+
+        const double snappedEnd = t.getLoopEndSeconds() * sr;
+        const bool moved = std::abs (snappedEnd - (double) requestedEnd) > 1.0;
+
+        t.startPlayback();
+
+        somnia::TapeLoop::Params q;
+        q.direction = somnia::TapeLoop::forward;
+        q.speed = 1.0f;
+
+        const int len = (int) std::round (t.getLoopLengthSeconds() * sr);
+        std::vector<float> win ((size_t) len + block, 0.0f);
+        int filled = 0;
+
+        while (filled < (int) win.size())
+        {
+            t.read (outL.data(), outR.data(), block, q, rng);
+            for (int i = 0; i < block && filled < (int) win.size(); ++i)
+                win[(size_t) filled++] = outL[(size_t) i];
+        }
+
+        const float edge = std::abs (win[(size_t) len - 1]);
+        snapOk = moved && edge < 0.06f;
+
+        if (! snapOk)
+            std::cout << "snap: requested=" << requestedEnd
+                      << " snapped=" << snappedEnd
+                      << " edge=" << edge << std::endl;
+    }
+
     std::cout << "clearRT=" << clearSilentOk << " windowWrite=" << windowWriteOk
               << " revFresh=" << reverseFreshOk << " tapeFull=" << tapeFullOk
               << std::endl;
@@ -663,6 +780,7 @@ int main()
               << " pingRms=" << pingRms << " pingAudible=" << pingAudible
               << " longPing=" << longPingOk
               << " drag=" << dragOk
+              << " clickFree=" << clickFreeOk << " snap=" << snapOk
               << " sync=" << syncOk << " bounds=" << boundsOk
               << " silent=" << silent << " nan=" << nanOk
               << " tail=" << tailAudible << "/" << tailSilent
@@ -672,7 +790,8 @@ int main()
            && longPingOk && dragOk
            && syncOk && boundsOk && silent && nanOk && tailAudible && tailSilent
            && clearOk
-           && clearSilentOk && windowWriteOk && reverseFreshOk && tapeFullOk))
+           && clearSilentOk && windowWriteOk && reverseFreshOk && tapeFullOk
+           && clickFreeOk && snapOk))
     {
         std::cout << "FAIL: tape loop" << std::endl;
         return 1;

@@ -77,6 +77,7 @@ public:
         recording    = false;
         overdubMode  = true;
         freshRecording = false;
+        takeStartPending = false;
         tapeHasContent = false;
         freeMode     = true;
         cycleCount   = 0;
@@ -172,6 +173,22 @@ public:
             return;
         }
 
+        // Both edges are nudged onto the nearest zero crossing of the material.
+        // The join between the loop end and its start is a physical splice: if
+        // either edge sits mid-waveform, every pass steps from that value to the
+        // other one and clicks.  On a zero crossing the two edges meet at
+        // silence, so the loop has a soft in and a soft out at any window.
+        const int limit = juce::jlimit (0, maxSamples,
+                                        juce::jmin ((int) tapeLength,
+                                                    writtenEnd.load (std::memory_order_relaxed)));
+        const int search = juce::jmax (1, (int) (0.010 * sampleRate));
+
+        if (limit > 8)
+        {
+            s = (double) snapToZeroCrossing ((int) s, 0, limit, search);
+            e = (double) snapToZeroCrossing ((int) e, 0, limit, search);
+        }
+
         const int minLen = juce::jmax (64, (int) (0.02 * sampleRate));
         if (e - s < minLen)
         {
@@ -228,7 +245,10 @@ public:
     //==========================================================================
     void startPlayback() noexcept
     {
+        // The head starts on the first sample of the loop window: without a fade
+        // the jump from silence to whatever the take begins with is a click.
         playing = true;
+        fadeGain = 0.0f;
     }
 
     void stopPlayback() noexcept
@@ -247,6 +267,7 @@ public:
         if (! overdub || loopLength < (double) minLoopSamples())
         {
             freshRecording = true;
+            takeStartPending = true;
             tapeHasContent = false;
             writeIndex = 0;
             readPos  = 0.0;
@@ -308,6 +329,14 @@ public:
             publishTapeLength();
         }
 
+        // A take that stops mid-waveform is a physical splice: on every pass the
+        // head jumps from that value straight to the loop start.  The last few
+        // milliseconds are tapered to exact zeros, so both edges of the loop meet
+        // in silence instead of clicking.
+        if (freshRecording && tapeHasContent
+            && loopLength >= (double) minLoopSamples())
+            fadeOutTakeTail ((int) (loopStart + loopLength) - 1);
+
         // writtenEnd is an absolute buffer index: everything at or beyond it has
         // never been recorded since the last erase.  copyWaveform clamps it to
         // the tape length, so keeping the largest value is safe.
@@ -336,6 +365,7 @@ public:
         cycleCount = 0;
         tapeHasContent = false;
         freshRecording = false;
+        takeStartPending = false;
         recording = false;
         playing = false;
         wrapFlag = false;
@@ -681,6 +711,16 @@ public:
             float nl = inl;
             float nr = inr;
 
+            // The take opens on a true zero: the first sample of the loop is a
+            // splice point, and material that starts mid-waveform clicks on every
+            // pass (most of all in reverse, where it becomes the loop end).
+            if (takeStartPending)
+            {
+                nl = 0.0f;
+                nr = 0.0f;
+                takeStartPending = false;
+            }
+
             if (overdubMode && fb > 0.0f)
             {
                 const float oldL = fbL != nullptr ? fbL[i] : bufferL[(size_t) wi];
@@ -718,6 +758,10 @@ public:
                     recording = false;
                     freshRecording = false;
                     tapeFull = true;
+
+                    // The take ends exactly at the tape end; taper it so the loop
+                    // join stays silent instead of clicking.
+                    fadeOutTakeTail (maxSamples - 1);
                     break;
                 }
             }
@@ -751,6 +795,54 @@ private:
     int minLoopSamples() const noexcept
     {
         return juce::jmax (64, (int) (0.02 * sampleRate));
+    }
+
+    // Tapers the material ending at lastIndex down to exact zeros over the last
+    // ~4 ms.  A loop join is a physical splice: a take that ends on a non-zero
+    // sample jumps straight to the loop start on every pass and clicks.
+    void fadeOutTakeTail (int lastIndex) noexcept
+    {
+        const int n = juce::jmin (juce::jmax (1, (int) (0.004 * sampleRate)),
+                                  lastIndex + 1);
+
+        for (int i = 0; i < n; ++i)
+        {
+            const float gain = (float) i / (float) n;
+            bufferL[(size_t) (lastIndex - i)] *= gain;
+            bufferR[(size_t) (lastIndex - i)] *= gain;
+        }
+    }
+
+    // Nearest sample index where the material crosses zero, searched outwards
+    // from `index` for at most `search` samples.  Used to put the loop edges on
+    // silence instead of mid-waveform; if the material has no crossing nearby
+    // (a very low tone) the requested index is kept unchanged.
+    int snapToZeroCrossing (int index, int lo, int hi, int search) const noexcept
+    {
+        index = juce::jlimit (lo, hi, index);
+
+        auto crosses = [this] (int i) noexcept
+        {
+            const float a = 0.5f * (bufferL[(size_t) (i - 1)] + bufferR[(size_t) (i - 1)]);
+            const float b = 0.5f * (bufferL[(size_t) i] + bufferR[(size_t) i]);
+            return (a <= 0.0f && b >= 0.0f) || (a >= 0.0f && b <= 0.0f);
+        };
+
+        for (int d = 0; d <= search; ++d)
+        {
+            const int before = index - d;
+            if (before > lo && before < hi && crosses (before))
+                return before;
+
+            if (d == 0)
+                continue;
+
+            const int after = index + d;
+            if (after > lo && after < hi && crosses (after))
+                return after;
+        }
+
+        return index;
     }
 
     void onWrap (int requestedDirection, juce::Random& rng) noexcept
@@ -991,6 +1083,10 @@ private:
     bool recording      = false;
     bool overdubMode    = true;
     bool freshRecording = false;
+
+    // Set by startRecording() for a brand-new take; write() consumes it to put a
+    // zero on the very first sample of the loop.
+    bool takeStartPending = false;
     bool tapeHasContent = false;
     bool freeMode       = true;
     bool wrapFlag       = false;

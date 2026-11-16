@@ -157,21 +157,23 @@ void TapeDisplay::timerCallback()
         reelLastPos = -1.0f;
     }
 
-    const bool changed = pulseActive
-                      || std::abs (pos - lastPos) > 0.00002f
-                      || cycles != lastCycles
-                      || rec != lastRecording
-                      || play != lastPlaying
-                      || std::abs (wear - lastWear) > 0.001f
-                      || std::abs (dropout - lastDropout) > 0.005f
-                      || dir != lastDirection
-                      || std::abs (tape - lastTape) > 0.001f
-                      || std::abs (start - lastStart) > 0.0005f
-                      || std::abs (end - lastEnd) > 0.0005f
-                      || hasTape != lastHasContent
-                      || writeVersion != lastWriteVersion
-                      || std::abs (envLevel - lastEnvLevel) > 0.004f
-                      || envStage != lastEnvStage;
+    const bool tapeChanged = std::abs (tape - lastTape) > 0.001f;
+    const bool boundsChanged = std::abs (start - lastStart) > 0.0005f
+                            || std::abs (end - lastEnd) > 0.0005f;
+
+    const bool telemetryChanged = std::abs (pos - lastPos) > 0.00002f
+                               || cycles != lastCycles
+                               || rec != lastRecording
+                               || play != lastPlaying
+                               || std::abs (wear - lastWear) > 0.001f
+                               || std::abs (dropout - lastDropout) > 0.005f
+                               || dir != lastDirection
+                               || hasTape != lastHasContent
+                               || writeVersion != lastWriteVersion
+                               || std::abs (envLevel - lastEnvLevel) > 0.004f
+                               || envStage != lastEnvStage;
+
+    const bool changed = pulseActive || telemetryChanged || tapeChanged || boundsChanged;
 
     if (! changed)
         return;
@@ -220,7 +222,13 @@ void TapeDisplay::timerCallback()
     lastEnvLevel = envLevel;
     lastEnvStage = envStage;
 
-    repaint();
+    // A marker move only touches the map and the footer.  Repainting the whole
+    // panel for it (header text, envelope plot and both reels) is what made a
+    // drag feel like it was running behind the mouse.
+    if (pulseActive || telemetryChanged || tapeChanged)
+        repaint();
+    else
+        repaint (dragRepaintArea());
 }
 
 //==============================================================================
@@ -736,6 +744,43 @@ void TapeDisplay::setBound (int which, float value)
     p->setValueNotifyingHost (p->convertTo0to1 (juce::jlimit (0.0f, 1.0f, value)));
 }
 
+void TapeDisplay::previewDragBounds (float start, float end,
+                                     float& newStart, float& newEnd) const
+{
+    newStart = start;
+    newEnd   = end;
+
+    if (! dragTargetValid || dragMarker < 0)
+        return;
+
+    const float n = dragTargetNorm;
+    const float minLen = minNorm();
+
+    if (dragMarker == 0)
+    {
+        newStart = juce::jlimit (0.0f, juce::jmax (0.0f, end - minLen), n);
+    }
+    else if (dragMarker == 1)
+    {
+        newEnd = juce::jlimit (juce::jmin (1.0f, start + minLen), 1.0f, n);
+    }
+    else
+    {
+        newStart = juce::jlimit (0.0f, juce::jmax (0.0f, 1.0f - dragLength),
+                                 n - dragOffset);
+        newEnd = newStart + dragLength;
+    }
+}
+
+void TapeDisplay::displayBounds (float& start, float& end) const
+{
+    start = (loopStartValue != nullptr ? loopStartValue->load() : 0.0f);
+    end   = (loopEndValue != nullptr ? loopEndValue->load() : 1.0f);
+
+    if (dragTargetValid && dragMarker >= 0)
+        previewDragBounds (start, end, start, end);
+}
+
 //==============================================================================
 void TapeDisplay::drawReel (juce::Graphics& g, juce::Point<float> centre,
                             float radius, float angle, bool active, float fill) const
@@ -1096,8 +1141,8 @@ void TapeDisplay::drawWave (juce::Graphics& g) const
     g.drawRoundedRectangle (waveArea.reduced (0.5f), 6.0f, 1.0f);
 
     const float tape = proc.getDisplayTapeLengthSeconds();
-    const float start = (loopStartValue != nullptr ? loopStartValue->load() : 0.0f);
-    const float end   = (loopEndValue != nullptr ? loopEndValue->load() : 1.0f);
+    float start = 0.0f, end = 1.0f;
+    displayBounds (start, end);
     const bool  hasTape = proc.getDisplayHasContent();
 
     if (! hasTape)
@@ -1244,8 +1289,8 @@ void TapeDisplay::drawFooter (juce::Graphics& g) const
     const auto textDim = findColour (SomniaLookAndFeel::textDimColourId);
 
     const float tape = proc.getDisplayTapeLengthSeconds();
-    const float start = (loopStartValue != nullptr ? loopStartValue->load() : 0.0f);
-    const float end   = (loopEndValue != nullptr ? loopEndValue->load() : 1.0f);
+    float start = 0.0f, end = 1.0f;
+    displayBounds (start, end);
 
     if (! proc.getDisplayHasContent())
     {
@@ -1294,10 +1339,22 @@ void TapeDisplay::mouseDown (const juce::MouseEvent& e)
     {
         dragMarker = -1;
         dragTargetValid = false;
+        endGestures();
         return;
     }
 
     dragMarker = markerAt (e.position.x);
+
+    // Report the whole drag as one automation gesture.  Without it every drag
+    // step arrived at the host as a separate write, and hosts that flush the
+    // parameter on each write made the marker feel sticky under the mouse.
+    endGestures();
+
+    if (dragMarker == 0 || dragMarker == 2)
+        beginGesture (ids::loopStart);
+
+    if (dragMarker == 1 || dragMarker == 2)
+        beginGesture (ids::loopEnd);
 
     if (dragMarker == 2)
     {
@@ -1316,25 +1373,22 @@ void TapeDisplay::applyDragTarget()
     if (! dragTargetValid || dragMarker < 0)
         return;
 
-    const float n = dragTargetNorm;
     const float start = (loopStartValue != nullptr ? loopStartValue->load() : 0.0f);
     const float end   = (loopEndValue != nullptr ? loopEndValue->load() : 1.0f);
-    const float minLen = minNorm();
+
+    float newStart = start, newEnd = end;
+    previewDragBounds (start, end, newStart, newEnd);
 
     if (dragMarker == 0)
     {
-        setBound (0, juce::jlimit (0.0f, juce::jmax (0.0f, end - minLen), n));
+        setBound (0, newStart);
     }
     else if (dragMarker == 1)
     {
-        setBound (1, juce::jlimit (juce::jmin (1.0f, start + minLen), 1.0f, n));
+        setBound (1, newEnd);
     }
     else if (dragMarker == 2)
     {
-        const float newStart = juce::jlimit (0.0f, juce::jmax (0.0f, 1.0f - dragLength),
-                                             n - dragOffset);
-        const float newEnd = newStart + dragLength;
-
         // Update in the direction of the move so the pair never inverts in the
         // middle of a block, which would clamp the window and restart the fade.
         if (newStart < start)
@@ -1358,6 +1412,12 @@ void TapeDisplay::mouseDrag (const juce::MouseEvent& e)
     dragTargetNorm = normAt (e.position.x);
     dragTargetValid = true;
 
+    // The marker is drawn from the pointer position while the drag is in
+    // flight, so the map has to be repainted here and not on the next timer
+    // tick.  Only the map and the footer change: the header, the reels and the
+    // cached waveform stay untouched, which is what keeps a drag smooth.
+    repaint (dragRepaintArea());
+
     const double now = juce::Time::getMillisecondCounterHiRes();
     if (now - lastDragPushMs < 16.0)
         return;
@@ -1372,6 +1432,32 @@ void TapeDisplay::mouseUp (const juce::MouseEvent&)
     applyDragTarget();
     dragTargetValid = false;
     dragMarker = -1;
+    endGestures();
+
+    repaint (dragRepaintArea());
+}
+
+juce::Rectangle<int> TapeDisplay::dragRepaintArea() const
+{
+    return waveArea.getUnion (footerArea).getSmallestIntegerContainer();
+}
+
+void TapeDisplay::beginGesture (const char* id)
+{
+    if (auto* p = paramFor (id))
+    {
+        p->beginChangeGesture();
+        gestureParams.push_back (p);
+    }
+}
+
+void TapeDisplay::endGestures()
+{
+    for (auto* p : gestureParams)
+        if (p != nullptr)
+            p->endChangeGesture();
+
+    gestureParams.clear();
 }
 
 void TapeDisplay::mouseMove (const juce::MouseEvent& e)
